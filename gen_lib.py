@@ -24,18 +24,22 @@ def get_week_and_employees(path):
     iso = dt.isocalendar()
     week = iso[1]
 
+    def _to_float(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
     row = 25
-    employees = []  # (name, prep_row, articles_row, articles_count)
+    employees = []  # (name, prep_row, articles_row, articles_count, commandes_count)
     while row <= ws.max_row:
         name = ws.cell(row=row, column=2).value
         if isinstance(name, str) and '(' in name and ')' in name:
+            prep_row = row + 1
             articles_row = row + 3
-            articles_count = ws.cell(row=articles_row, column=3).value
-            try:
-                articles_count = float(articles_count) if articles_count is not None else None
-            except (TypeError, ValueError):
-                articles_count = None
-            employees.append((name.strip(), row+1, articles_row, articles_count))
+            articles_count = _to_float(ws.cell(row=articles_row, column=3).value)
+            commandes_count = _to_float(ws.cell(row=prep_row, column=3).value)
+            employees.append((name.strip(), prep_row, articles_row, articles_count, commandes_count))
             row += 12
         else:
             row += 1
@@ -248,14 +252,16 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     green_fill = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
     blue_font = Font(name=arial, color='0000FF')
 
-    for i, (name, prep_row, art_row, articles_count) in enumerate(employees):
+    for i, (name, prep_row, art_row, articles_count, commandes_count) in enumerate(employees):
         r = first_data_row + i
         matricule = extract_matricule(name)
         ws.cell(row=r, column=1, value=name).font = Font(name=arial)
 
+        b_value = None
         cb = ws.cell(row=r, column=2)
         if name in hours_map:
-            cb.value = hours_map[name]
+            b_value = hours_map[name]
+            cb.value = b_value
             cb.fill = green_fill
             cb.font = Font(name=arial)
         else:
@@ -264,23 +270,41 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
             cb.font = blue_font
         cb.number_format = '0.00'
 
-        cc = ws.cell(row=r, column=3, value=f"='{prep_sheet_name}'!C{art_row}")
+        # C/D/E/F/G : quand les heures (B) sont deja connues (auto-remplies
+        # depuis le planning), on ecrit des valeurs litterales calculees en
+        # Python plutot que des formules — certains lecteurs (Numbers, aperçus)
+        # n'executent pas toujours le recalcul des formules a l'ouverture, ce
+        # qui laissait ces colonnes a 0/vide. Quand B reste manuel (jaune), on
+        # garde les formules d'origine pour un calcul live des que l'utilisateur
+        # saisit une valeur dans Excel.
+        e_value = None
+        if b_value:
+            cc = ws.cell(row=r, column=3, value=articles_count if articles_count is not None else 0)
+            cd = ws.cell(row=r, column=4, value=commandes_count if commandes_count is not None else 0)
+            e_value = (articles_count / b_value) if articles_count is not None else None
+            ce = ws.cell(row=r, column=5, value=e_value)
+            cf = ws.cell(row=r, column=6, value=(e_value / 60) if e_value is not None else None)
+            cg = ws.cell(row=r, column=7, value=(commandes_count / b_value) if commandes_count is not None else None)
+        else:
+            cc = ws.cell(row=r, column=3, value=f"='{prep_sheet_name}'!C{art_row}")
+            cd = ws.cell(row=r, column=4, value=f"='{prep_sheet_name}'!C{prep_row}")
+            ce = ws.cell(row=r, column=5, value=f"=IFERROR(C{r}/B{r},\"\")")
+            cf = ws.cell(row=r, column=6, value=f"=IFERROR(E{r}/60,\"\")")
+            cg = ws.cell(row=r, column=7, value=f"=IFERROR(D{r}/B{r},\"\")")
         cc.font = Font(name=arial, color='008000')
-        cd = ws.cell(row=r, column=4, value=f"='{prep_sheet_name}'!C{prep_row}")
         cd.font = Font(name=arial, color='008000')
-        ce = ws.cell(row=r, column=5, value=f"=IFERROR(C{r}/B{r},\"\")")
         ce.font = Font(name=arial)
         ce.number_format = '0.00'
-        cf = ws.cell(row=r, column=6, value=f"=IFERROR(E{r}/60,\"\")")
         cf.font = Font(name=arial)
         cf.number_format = '0.00'
-        cg = ws.cell(row=r, column=7, value=f"=IFERROR(D{r}/B{r},\"\")")
         cg.font = Font(name=arial)
         cg.number_format = '0.00'
 
+        h_value = None
         ch = ws.cell(row=r, column=8)
         if matricule and matricule in productivite_s1:
-            ch.value = productivite_s1[matricule]
+            h_value = productivite_s1[matricule]
+            ch.value = h_value
             ch.fill = green_fill
             ch.font = Font(name=arial)
         else:
@@ -289,16 +313,25 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
             ch.font = blue_font
         ch.number_format = '0.00'
 
-        ci = ws.cell(row=r, column=9,
-                      value=f"=IFERROR(IF(OR(E{r}=\"\",H{r}=\"\"),\"\",IF(E{r}>=H{r},\"▲ \",\"▼ \")&ROUND(ABS(E{r}-H{r})/H{r}*100,1)&\"%\"),\"\")")
+        ci = ws.cell(row=r, column=9)
+        if e_value is not None and h_value:
+            arrow = '▲ ' if e_value >= h_value else '▼ '
+            pct = round(abs(e_value - h_value) / h_value * 100, 1)
+            ci.value = f"{arrow}{pct}%"
+        elif b_value and h_value is None:
+            # B connu mais S-1 pas encore disponible : rien a comparer.
+            ci.value = ""
+        else:
+            ci.value = (f"=IFERROR(IF(OR(E{r}=\"\",H{r}=\"\"),\"\",IF(E{r}>=H{r},\"▲ \",\"▼ \")"
+                        f"&ROUND(ABS(E{r}-H{r})/H{r}*100,1)&\"%\"),\"\")")
         ci.font = Font(name=arial, bold=True)
         ci.alignment = Alignment(horizontal='center')
 
         # Productivite calculee cette semaine (pour servir de S-1 la semaine prochaine)
-        if matricule and name in hours_map and hours_map[name] and articles_count is not None:
+        if matricule and b_value and articles_count is not None:
             employee_productivity_this_week[matricule] = {
                 'nom': name,
-                'productivite_h': round(articles_count / hours_map[name], 2),
+                'productivite_h': round(articles_count / b_value, 2),
             }
 
     headers2 = ['Productivité /H S-1', '% Évolution vs S-1']

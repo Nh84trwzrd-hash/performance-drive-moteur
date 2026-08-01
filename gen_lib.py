@@ -278,13 +278,13 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
         # garde les formules d'origine pour un calcul live des que l'utilisateur
         # saisit une valeur dans Excel.
         e_value = None
-        if b_value:
+        if b_value is not None:
             cc = ws.cell(row=r, column=3, value=articles_count if articles_count is not None else 0)
             cd = ws.cell(row=r, column=4, value=commandes_count if commandes_count is not None else 0)
-            e_value = (articles_count / b_value) if articles_count is not None else None
+            e_value = (articles_count / b_value) if (articles_count is not None and b_value) else None
             ce = ws.cell(row=r, column=5, value=e_value)
             cf = ws.cell(row=r, column=6, value=(e_value / 60) if e_value is not None else None)
-            cg = ws.cell(row=r, column=7, value=(commandes_count / b_value) if commandes_count is not None else None)
+            cg = ws.cell(row=r, column=7, value=(commandes_count / b_value) if (commandes_count is not None and b_value) else None)
         else:
             cc = ws.cell(row=r, column=3, value=f"='{prep_sheet_name}'!C{art_row}")
             cd = ws.cell(row=r, column=4, value=f"='{prep_sheet_name}'!C{prep_row}")
@@ -314,11 +314,14 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
         ch.number_format = '0.00'
 
         ci = ws.cell(row=r, column=9)
-        if e_value is not None and h_value:
+        if e_value is not None and h_value is not None and h_value != 0:
             arrow = '▲ ' if e_value >= h_value else '▼ '
             pct = round(abs(e_value - h_value) / h_value * 100, 1)
             ci.value = f"{arrow}{pct}%"
-        elif b_value and h_value is None:
+        elif b_value is not None and h_value is not None and h_value == 0:
+            # Division par zero (S-1 = 0) : rien de comparable, comme IFERROR->"" cote Excel.
+            ci.value = ""
+        elif b_value is not None and h_value is None:
             # B connu mais S-1 pas encore disponible : rien a comparer.
             ci.value = ""
         else:

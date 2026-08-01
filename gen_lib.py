@@ -387,6 +387,7 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     for col, w in widths3.items():
         ws.column_dimensions[col].width = w
 
+    wb.calculation.fullCalcOnLoad = True
     wb.save(outpath)
     wb = openpyxl.load_workbook(outpath)
     ws = wb[prod_sheet_name]
@@ -424,5 +425,6 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     chart_anchor_row = last_data_row + 4
     ws.add_chart(chart, f'A{chart_anchor_row}')
 
+    wb.calculation.fullCalcOnLoad = True
     wb.save(outpath)
     return week, n, employee_productivity_this_week

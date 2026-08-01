@@ -313,20 +313,23 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
             ch.font = blue_font
         ch.number_format = '0.00'
 
+        # % Evolution vs S-1 : difference entre Productivite/H (E, semaine
+        # actuelle) et Productivite/H S-1 (H), exprimee en % de la valeur
+        # ACTUELLE (E) — donc (E-H)/E*100, pas /H.
         ci = ws.cell(row=r, column=9)
-        if e_value is not None and h_value is not None and h_value != 0:
+        if e_value is not None and h_value is not None and e_value != 0:
             arrow = '▲ ' if e_value >= h_value else '▼ '
-            pct = round(abs(e_value - h_value) / h_value * 100, 1)
+            pct = round(abs(e_value - h_value) / e_value * 100, 1)
             ci.value = f"{arrow}{pct}%"
-        elif b_value is not None and h_value is not None and h_value == 0:
-            # Division par zero (S-1 = 0) : rien de comparable, comme IFERROR->"" cote Excel.
+        elif b_value is not None and h_value is not None and e_value == 0:
+            # Division par zero (productivite actuelle = 0) : rien de comparable.
             ci.value = ""
         elif b_value is not None and h_value is None:
             # B connu mais S-1 pas encore disponible : rien a comparer.
             ci.value = ""
         else:
             ci.value = (f"=IFERROR(IF(OR(E{r}=\"\",H{r}=\"\"),\"\",IF(E{r}>=H{r},\"▲ \",\"▼ \")"
-                        f"&ROUND(ABS(E{r}-H{r})/H{r}*100,1)&\"%\"),\"\")")
+                        f"&ROUND(ABS(E{r}-H{r})/E{r}*100,1)&\"%\"),\"\")")
         ci.font = Font(name=arial, bold=True)
         ci.alignment = Alignment(horizontal='center')
 

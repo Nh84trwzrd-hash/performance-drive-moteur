@@ -1,4 +1,4 @@
-import openpyxl, re, datetime, unicodedata
+import openpyxl, re, datetime, unicodedata, shutil, subprocess, tempfile, os
 from difflib import SequenceMatcher
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.chart import BarChart, Reference
@@ -333,15 +333,43 @@ NAME_ALIASES = {
 }
 
 
-def match_planning_hours(planning_hours, employee_names, threshold=0.82):
+_NAME_MATCH_THRESHOLD = 0.82
+
+
+def parse_alias_pairs(raw_pairs):
+    """Convertit une liste de paires de noms bruts [(nom_preparation,
+    nom_planning), ...] (ex: lues depuis une Data Table n8n persistante) en
+    dict {tuple_tokens_preparation: tuple_tokens_planning} au format attendu
+    par match_planning_hours. C'est le mecanisme qui permet d'apprendre de
+    nouveaux alias SANS toucher au code : un alias confirme par Adrien est
+    ajoute comme une ligne de donnee (persistante, relue a chaque
+    generation), pas comme une constante codee en dur necessitant un
+    redeploiement."""
+    out = {}
+    for prep_name, plan_name in raw_pairs or []:
+        if not prep_name or not plan_name:
+            continue
+        out[tuple(_normalize_name_tokens(prep_name))] = tuple(_normalize_name_tokens(plan_name))
+    return out
+
+
+def match_planning_hours(planning_hours, employee_names, threshold=_NAME_MATCH_THRESHOLD, extra_aliases=None):
     """Associe chaque employe (nom tel qu'il figure dans la Preparation) aux
     heures Drive du planning, en tolerant fautes de frappe et ordre nom/prenom
     inverse. Ne renvoie une valeur que pour les employes matches avec un score
     suffisant ; les autres sont absents du dict retourne (fallback manuel).
 
-    Verifie d'abord NAME_ALIASES (match exact garanti pour les cas connus ou
-    le nom Preparation et le nom planning n'ont rien en commun), avant de
-    retomber sur le matching flou pour tous les autres employes."""
+    Verifie d'abord les alias connus (match exact garanti pour les cas ou le
+    nom Preparation et le nom planning n'ont rien en commun) avant de
+    retomber sur le matching flou pour tous les autres employes. `extra_aliases`
+    (deja au format tuple_tokens -> tuple_tokens, voir parse_alias_pairs) est
+    fusionne par-dessus les alias codes en dur NAME_ALIASES et les prevaut en
+    cas de doublon — c'est la table persistante (Data Table n8n) qui doit
+    gagner, puisqu'elle peut etre corrigee sans toucher au code."""
+    aliases = dict(NAME_ALIASES)
+    if extra_aliases:
+        aliases.update(extra_aliases)
+
     normalized_planning = {}
     for plan_name, hours in planning_hours.items():
         normalized_planning.setdefault(tuple(_normalize_name_tokens(plan_name)), hours)
@@ -349,7 +377,7 @@ def match_planning_hours(planning_hours, employee_names, threshold=0.82):
     matched = {}
     for emp_name in employee_names:
         emp_tokens = tuple(_normalize_name_tokens(emp_name))
-        alias_tokens = NAME_ALIASES.get(emp_tokens)
+        alias_tokens = aliases.get(emp_tokens)
         if alias_tokens is not None and alias_tokens in normalized_planning:
             matched[emp_name] = normalized_planning[alias_tokens]
             continue
@@ -364,12 +392,16 @@ def match_planning_hours(planning_hours, employee_names, threshold=0.82):
     return matched
 
 
-def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path=None, productivite_s1=None):
+def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path=None, productivite_s1=None,
+          name_aliases=None):
     """productivite_s1: dict {matricule: productivite_h_decimale} issu de la
-    semaine precedente, utilise pour auto-remplir la colonne H. Retourne
-    (semaine, nb_employes, productivite_calculee) ou productivite_calculee
-    est un dict {matricule: productivite_h_decimale} pour cette semaine,
-    a persister pour servir de S-1 la semaine suivante."""
+    semaine precedente, utilise pour auto-remplir la colonne H. name_aliases:
+    alias supplementaires (deja au format tuple_tokens -> tuple_tokens, voir
+    parse_alias_pairs) issus d'une source persistante (Data Table n8n) plutot
+    que codes en dur, fusionnes par-dessus NAME_ALIASES. Retourne (semaine,
+    nb_employes, productivite_calculee) ou productivite_calculee est un dict
+    {matricule: productivite_h_decimale} pour cette semaine, a persister pour
+    servir de S-1 la semaine suivante."""
     week, employees = get_week_and_employees(path)
     periode_debut, periode_fin = get_periode(path)
 
@@ -381,7 +413,7 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
         # le suivi de productivite ne porte que sur une partie de celle-ci
         # (ex: premiere semaine d'un cycle qui demarre un mercredi).
         planning_hours = parse_planning_pdf(planning_path, date_start=periode_debut, date_end=periode_fin)
-        hours_map = match_planning_hours(planning_hours, [e[0] for e in employees])
+        hours_map = match_planning_hours(planning_hours, [e[0] for e in employees], extra_aliases=name_aliases)
 
     productivite_s1 = productivite_s1 or {}
     employee_productivity_this_week = {}
@@ -961,6 +993,24 @@ def generate_podium_pdf(pdf_path, week, employee_productivity, taux_actuelle=Non
             c.drawString(480, row_y + text_y_offset, f"{arrow} {p['evo']:.1f}%")
         y = row_y
 
+    # Garde-fou structurel : la table de classement ne doit JAMAIS empieter
+    # sur le bloc "Taux de rupture" dessine juste apres. row_h est deja
+    # calcule pour que ça tienne (voir plus haut), mais si un cas extreme
+    # (ex: un tres grand nombre de collaborateurs classes une semaine
+    # donnee) fait quand meme deborder malgre le plancher de 12pt, on
+    # prefere echouer bruyamment ici plutot que livrer silencieusement un
+    # PDF avec un chevauchement visuel — c'est exactement le type de bug
+    # remonte sur la semaine 28 avant ce correctif.
+    if list_rows and y < box_top - 0.5:
+        raise RuntimeError(
+            f"Mise en page podium semaine {week} : le classement (jusqu'a y={y:.1f}) "
+            f"chevaucherait le bloc Taux de rupture (qui commence a y={box_top:.1f}). "
+            f"Trop de collaborateurs classes ({len(list_rows)} lignes hors podium) pour "
+            f"tenir dans l'espace disponible meme a hauteur de ligne minimale. "
+            f"Generation du PDF annulee — a corriger (ex: pagination, ou reduire le nombre "
+            f"de lignes affichees) plutot que livrer un visuel casse."
+        )
+
     # ---- Taux de rupture (position deja fixee plus haut, ancree sur le
     # bas de page : voir box_y/ribbon_y calcules avant la table)
     _pdm_rounded_card(c, 36, box_y, W - 72, taux_h, BLACK, radius=12)
@@ -1020,3 +1070,354 @@ def generate_podium_pdf(pdf_path, week, employee_productivity, taux_actuelle=Non
 
     c.save()
     return len(ranking)
+
+
+# ---------------------------------------------------------------------------
+# Verification post-generation (agent de controle qualite) - recontrole,
+# de maniere independante, ce que build() vient de produire, pour detecter
+# avant l'envoi les classes de bugs deja rencontrees en production :
+# heures incoherentes avec le planning, employe non retrouve automatiquement
+# (alias manquant), formules figees au lieu de formules dynamiques, fichier
+# corrompu au recalcul. Ne leve pas d'exception : retourne un rapport que
+# l'appelant (endpoint HTTP / n8n) utilise pour decider quoi faire (bloquer,
+# alerter en parallele, envoyer quand meme...).
+# ---------------------------------------------------------------------------
+
+_XLSX_ERROR_RE = re.compile(r'^#(DIV/0!|N/A|NAME\?|NULL!|NUM!|REF!|VALUE!)$')
+
+
+def _soffice_binary():
+    for name in ("soffice", "libreoffice"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def _recalc_with_libreoffice(xlsx_path, timeout=45):
+    """Tente un recalcul via LibreOffice headless (meme principe que le
+    script recalc.py utilise pendant le developpement). Retourne (ok, msg) :
+    ok=True si le recalcul a reussi sans erreur de formule (le fichier est
+    alors reecrit avec les valeurs mises en cache, utile pour les
+    visionneuses qui n'executent pas de recalcul automatique comme
+    l'apercu Google Drive) ; ok=None si LibreOffice n'est pas installe sur
+    ce serveur (verification sautee — PAS un echec en soi, puisque
+    fullCalcOnLoad force Excel a recalculer a l'ouverture de toute facon) ;
+    ok=False si des erreurs de formule ont ete trouvees ou si la conversion
+    a echoue."""
+    soffice = _soffice_binary()
+    if not soffice:
+        return None, ("LibreOffice non installe sur ce serveur : recalcul non verifie "
+                       "(Excel recalculera correctement a l'ouverture grace a fullCalcOnLoad, "
+                       "mais un apercu Drive/Docs peut rester vide tant que le fichier n'a pas "
+                       "ete ouvert au moins une fois dans Excel).")
+    out_dir = tempfile.mkdtemp(prefix="recalc_")
+    try:
+        proc = subprocess.run(
+            [soffice, "--headless", "--norestore", "--convert-to",
+             "xlsx:Calc MS Excel 2007 XML", "--outdir", out_dir, xlsx_path],
+            capture_output=True, timeout=timeout,
+        )
+        converted = os.path.join(out_dir, os.path.basename(xlsx_path))
+        if proc.returncode != 0 or not os.path.exists(converted):
+            return False, f"LibreOffice a echoue (code {proc.returncode}): {proc.stderr.decode(errors='ignore')[:500]}"
+        wb = openpyxl.load_workbook(converted, data_only=True)
+        bad = []
+        for ws in wb.worksheets:
+            for row in ws.iter_rows():
+                for cell in row:
+                    if isinstance(cell.value, str) and _XLSX_ERROR_RE.match(cell.value):
+                        bad.append(f"{ws.title}!{cell.coordinate}={cell.value}")
+        if bad:
+            return False, f"{len(bad)} erreur(s) de formule apres recalcul: " + ", ".join(bad[:10])
+        shutil.copyfile(converted, xlsx_path)
+        return True, "Recalcul LibreOffice OK, 0 erreur de formule."
+    except subprocess.TimeoutExpired:
+        return False, f"Recalcul LibreOffice : timeout ({timeout}s)."
+    except Exception as e:
+        return False, f"Recalcul LibreOffice : erreur inattendue ({e})."
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def verify_output(prep_path, xlsx_path, planning_path=None, name_aliases=None, recalc=True):
+    """Controle qualite du fichier "Performance Drive" genere, avant envoi.
+
+    Recalcule independamment les heures Drive depuis le planning et les
+    compare a ce qui a ete ecrit dans le fichier (au lieu de faire confiance
+    aveuglement au resultat de build()), verifie que les colonnes calculees
+    restent des formules dynamiques (pas des valeurs figees), signale tout
+    employe que le matching automatique n'a pas retrouve dans le planning
+    (avec le nom le plus proche trouve, pour faciliter l'ajout d'un alias),
+    et tente un recalcul LibreOffice pour detecter une erreur de formule.
+
+    Retourne {"ok": bool, "errors": [...], "warnings": [...], "week": int}.
+    - errors : problemes qui remettent en cause l'exactitude des donnees ou
+      cassent le fichier -> ne doit jamais partir tel quel (bloquant).
+    - warnings : points a verifier par un humain (ex: employe non retrouve
+      automatiquement) mais qui n'invalident pas le fichier -> peut partir,
+      avec une notification en parallele plutot qu'un blocage."""
+    errors, warnings = [], []
+
+    week, employees = get_week_and_employees(prep_path)
+    periode_debut, periode_fin = get_periode(prep_path)
+
+    hours_map, planning_hours = {}, {}
+    if planning_path:
+        planning_hours = parse_planning_pdf(planning_path, date_start=periode_debut, date_end=periode_fin)
+        hours_map = match_planning_hours(planning_hours, [e[0] for e in employees], extra_aliases=name_aliases)
+
+    prod_sheet_name = f'Feuil2 Productivité Semaine {week}'
+
+    wb_f = openpyxl.load_workbook(xlsx_path, data_only=False)
+    if prod_sheet_name not in wb_f.sheetnames:
+        errors.append(f"Feuille '{prod_sheet_name}' absente du fichier genere (attendu pour la semaine {week}).")
+        return {"ok": False, "errors": errors, "warnings": warnings, "week": week}
+    ws_f = wb_f[prod_sheet_name]
+
+    wb_v = openpyxl.load_workbook(xlsx_path, data_only=True)
+    ws_v = wb_v[prod_sheet_name]
+
+    for i, (name, prep_row, art_row, articles_count, commandes_count) in enumerate(employees):
+        r = 3 + i
+        cell_name = ws_v.cell(row=r, column=1).value
+        if cell_name != name:
+            errors.append(f"Ligne {r}: nom attendu '{name}', trouve '{cell_name}' (desalignement des lignes).")
+            continue
+
+        if planning_path:
+            b_actual = ws_v.cell(row=r, column=2).value
+            b_expected = hours_map.get(name)
+            if b_expected is not None:
+                if b_actual is None or abs(float(b_actual) - float(b_expected)) > 0.01:
+                    errors.append(
+                        f"{name}: heures ecrites dans le fichier ({b_actual}) different des heures "
+                        f"recalculees independamment depuis le planning ({b_expected}) sur la periode "
+                        f"{periode_debut}..{periode_fin}."
+                    )
+            else:
+                # Pas de correspondance automatique : comportement normal
+                # (cellule laissee vide pour saisie manuelle), sauf si un nom
+                # de planning suffisamment proche existe malgre tout — signe
+                # possible d'un alias manquant (cas "Couette Couette /
+                # Gonzales-Manrubio J").
+                best_score, best_plan_name = 0.0, None
+                for plan_name in planning_hours:
+                    s = _name_match_score(plan_name, name)
+                    if s > best_score:
+                        best_score, best_plan_name = s, plan_name
+                if best_plan_name and 0.25 <= best_score < _NAME_MATCH_THRESHOLD:
+                    warnings.append(
+                        f"{name}: aucune heure trouvee automatiquement dans le planning. Nom le plus "
+                        f"proche trouve : '{best_plan_name}' ({planning_hours[best_plan_name]}h, score de "
+                        f"similarite {best_score:.2f} — trop different pour un rapprochement automatique "
+                        f"fiable). Si c'est la meme personne, confirmer pour ajouter l'alias."
+                    )
+                elif b_actual is None:
+                    warnings.append(f"{name}: aucune heure trouvee dans le planning, saisie manuelle necessaire.")
+
+        for col, label in ((3, 'C'), (4, 'D'), (5, 'E'), (6, 'F'), (7, 'G'), (9, 'I')):
+            v = ws_f.cell(row=r, column=col).value
+            if not (isinstance(v, str) and v.startswith('=')):
+                errors.append(
+                    f"{name}, colonne {label}{r}: valeur figee au lieu d'une formule ({v!r}) — le fichier "
+                    f"ne se recalculera plus si l'utilisateur modifie ses heures dans Excel."
+                )
+
+    if not ws_f._charts:
+        errors.append("Aucun graphique trouve sur la feuille de productivite.")
+
+    if recalc:
+        recalc_ok, recalc_msg = _recalc_with_libreoffice(xlsx_path)
+        if recalc_ok is False:
+            errors.append(recalc_msg)
+        elif recalc_ok is None:
+            warnings.append(recalc_msg)
+
+    return {"ok": len(errors) == 0, "errors": errors, "warnings": warnings, "week": week}
+
+
+def verify_podium_pdf(pdf_path, expected_min_collaborateurs=1):
+    """Controle qualite du PDF podium : le generateur (generate_podium_pdf)
+    leve deja une RuntimeError si le classement chevaucherait le bloc Taux
+    de rupture, donc un PDF qui existe a deja passe ce garde-fou structurel.
+    Cette fonction complete par un controle generique, independant de la
+    logique de dessin : aucun texte rendu ne doit se chevaucher visuellement
+    avec un autre, quelle que soit la section concernee — de quoi attraper
+    une future regression de mise en page ailleurs sur la page, pas
+    seulement dans le classement."""
+    errors, warnings = [], []
+    if pdfplumber is None:
+        warnings.append("pdfplumber non installe : verification visuelle du PDF sautee.")
+        return {"ok": True, "errors": errors, "warnings": warnings}
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            if not pdf.pages:
+                errors.append("Le PDF genere ne contient aucune page.")
+                return {"ok": False, "errors": errors, "warnings": warnings}
+            page = pdf.pages[0]
+            words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
+            if len(words) < 10:
+                errors.append(f"Page quasiment vide ({len(words)} mot(s) detecte(s)) — rendu probablement casse.")
+
+            # Detecte deux mots dont les rectangles se chevauchent nettement
+            # (hors mots naturellement adjacents sur la meme ligne) : signe
+            # d'un element de mise en page qui en recouvre un autre.
+            def _iou(a, b):
+                ix0, iy0 = max(a['x0'], b['x0']), max(a['top'], b['top'])
+                ix1, iy1 = min(a['x1'], b['x1']), min(a['bottom'], b['bottom'])
+                if ix1 <= ix0 or iy1 <= iy0:
+                    return 0.0
+                inter = (ix1 - ix0) * (iy1 - iy0)
+                area_a = (a['x1'] - a['x0']) * (a['bottom'] - a['top'])
+                area_b = (b['x1'] - b['x0']) * (b['bottom'] - b['top'])
+                return inter / max(1.0, min(area_a, area_b))
+
+            overlaps = []
+            for i in range(len(words)):
+                for j in range(i + 1, len(words)):
+                    wa, wb = words[i], words[j]
+                    same_line = abs(wa['top'] - wb['top']) < 2
+                    if same_line:
+                        continue  # mots cote a cote sur une meme ligne : normal
+                    if _iou(wa, wb) > 0.3:
+                        overlaps.append(f"'{wa['text']}' chevauche '{wb['text']}' (lignes differentes)")
+            if overlaps:
+                errors.append(f"{len(overlaps)} chevauchement(s) de texte detecte(s) : " + "; ".join(overlaps[:5]))
+    except Exception as e:
+        warnings.append(f"Verification visuelle du PDF impossible ({e}).")
+
+    return {"ok": len(errors) == 0, "errors": errors, "warnings": warnings}
+
+
+# ---------------------------------------------------------------------------
+# Relecture visuelle par IA (Claude) - complement des controles
+# deterministes ci-dessus. verify_podium_pdf() ne peut reperer que les
+# categories de problemes anticipees a l'avance (texte qui se chevauche).
+# Cette fonction va plus loin : elle montre une image du PDF genere a un
+# modele Claude et lui demande une relecture libre, capable en principe de
+# reperer un probleme visuel jamais vu auparavant (couleur illisible,
+# element mal aligne, incoherence entre le chiffre affiche et le contexte,
+# etc.) — exactement le type de controle fait manuellement tout au long de
+# cette conversation. Degradation gracieuse si PyMuPDF ou le SDK Anthropic
+# ne sont pas installes, ou si aucune cle API n'est configuree : la
+# relecture est alors sautee (warning, jamais bloquant), le reste du
+# pipeline (controles deterministes) continue de s'appliquer normalement.
+# ---------------------------------------------------------------------------
+
+try:
+    import fitz  # PyMuPDF - rendu PDF->image sans dependance systeme (contrairement a poppler)
+except ImportError:
+    fitz = None
+
+try:
+    import anthropic as _anthropic_sdk
+except ImportError:
+    _anthropic_sdk = None
+
+DEFAULT_VISION_MODEL = "claude-sonnet-5"
+
+_VISION_PROMPT = """Tu relis le PDF hebdomadaire "Podium Performance Drive" d'un magasin \
+Intermarché (charte rouge/noir/blanc), affiché en salle de pause et envoyé par email à un \
+responsable. Ton rôle : repérer tout défaut visuel qui rendrait ce document gênant à \
+diffuser tel quel, exactement comme le ferait un relecteur humain attentif avant envoi.
+
+Vérifie en particulier :
+- Chevauchement ou texte coupé/tronqué entre deux éléments (ex: le classement qui empiète \
+sur le bloc "Taux de rupture", un nom qui déborde de sa carte).
+- Zone blanche ou manifestement vide qui ne devrait pas l'être.
+- Couleur de texte illisible sur son fond (ex: texte clair sur fond clair).
+- Incohérence visible entre les chiffres affichés (ex: un podium où le rang 1 affiche une \
+productivité plus faible que le rang 2).
+- Tout élément visuellement cassé, mal aligné, ou qui a l'air d'un bug de génération.
+
+Un texte simplement dense ou une mise en page serrée n'est PAS un défaut si tout reste \
+lisible et rien ne se chevauche.
+
+Réponds UNIQUEMENT avec un JSON strict, sans texte autour, au format :
+{"ok": true ou false, "issues": ["description precise du probleme 1", ...]}
+Si tout est correct, renvoie {"ok": true, "issues": []}."""
+
+
+def render_pdf_page_png(pdf_path, page_index=0, zoom=2.0):
+    """Rend une page du PDF en PNG (bytes) via PyMuPDF, sans dependance
+    systeme externe (contrairement a pdftoppm/poppler). Retourne None si
+    PyMuPDF n'est pas installe ou si le rendu echoue."""
+    if fitz is None:
+        return None
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            if page_index >= len(doc):
+                return None
+            page = doc[page_index]
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+            return pix.tobytes("png")
+        finally:
+            doc.close()
+    except Exception:
+        return None
+
+
+def ai_visual_review(pdf_path, api_key=None, model=None):
+    """Demande a un modele Claude de relire visuellement la premiere page du
+    PDF genere. Retourne {"ok": bool, "issues": [...], "skipped": bool,
+    "warnings": [...]}. `skipped=True` (avec ok=True) si la relecture n'a
+    pas pu avoir lieu (dependance manquante ou cle API absente) — c'est un
+    warning non-bloquant, pas un echec : le pipeline continue avec les
+    seuls controles deterministes dans ce cas."""
+    import base64, json as _json, os as _os
+
+    api_key = api_key or _os.environ.get("ANTHROPIC_API_KEY")
+    model = model or _os.environ.get("ANTHROPIC_VISION_MODEL", DEFAULT_VISION_MODEL)
+
+    if fitz is None:
+        return {"ok": True, "issues": [], "skipped": True,
+                "warnings": ["PyMuPDF non installe : relecture visuelle IA sautee."]}
+    if _anthropic_sdk is None:
+        return {"ok": True, "issues": [], "skipped": True,
+                "warnings": ["SDK anthropic non installe : relecture visuelle IA sautee."]}
+    if not api_key:
+        return {"ok": True, "issues": [], "skipped": True,
+                "warnings": ["ANTHROPIC_API_KEY absente : relecture visuelle IA sautee."]}
+
+    png_bytes = render_pdf_page_png(pdf_path)
+    if not png_bytes:
+        return {"ok": True, "issues": [], "skipped": True,
+                "warnings": ["Rendu PNG du PDF impossible : relecture visuelle IA sautee."]}
+
+    try:
+        client = _anthropic_sdk.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png",
+                        "data": base64.b64encode(png_bytes).decode("ascii"),
+                    }},
+                    {"type": "text", "text": _VISION_PROMPT},
+                ],
+            }],
+        )
+        text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
+        # Tolerant aux modeles qui entourent le JSON de ```...``` malgre la consigne.
+        if text.startswith("```"):
+            text = text.strip("`")
+            text = text[4:] if text.lower().startswith("json") else text
+        parsed = _json.loads(text)
+        return {
+            "ok": bool(parsed.get("ok", False)),
+            "issues": list(parsed.get("issues", [])),
+            "skipped": False,
+            "warnings": [],
+        }
+    except Exception as e:
+        # Une relecture IA qui echoue techniquement (timeout, reponse
+        # malformee, quota...) ne doit jamais bloquer tout le pipeline
+        # hebdomadaire a elle seule -> warning, pas erreur.
+        return {"ok": True, "issues": [], "skipped": True,
+                "warnings": [f"Relecture visuelle IA indisponible ({e})."]}

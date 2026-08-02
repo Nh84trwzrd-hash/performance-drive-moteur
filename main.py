@@ -162,3 +162,37 @@ async def productivity(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur lors du calcul de productivité : {e}")
+
+
+@app.post("/podium")
+async def podium(
+    preparation: UploadFile = File(..., description="Fichier Preparation .xlsx"),
+    planning: Optional[UploadFile] = File(default=None, description="Planning PDF hebdomadaire (optionnel)"),
+    taux_actuelle: Optional[float] = Query(default=None, description="Taux de rupture de la semaine courante (fraction)"),
+    taux_precedente: Optional[float] = Query(default=None, description="Taux de rupture de la semaine précédente (fraction)"),
+    semaine: Optional[int] = Query(default=None),
+    productivite_s1: Optional[str] = Query(default=None),
+):
+    """Meme traitement que /generate mais renvoie le PDF "podium" visuel
+    (classement + rappel taux de rupture, charte Intermarché) destine a etre
+    affiche en salle de pause. Appele par n8n en parallele de /generate."""
+    try:
+        work_dir, _out_path, _out_name, week, employee_productivity = await _run_build(
+            preparation, planning, taux_actuelle, taux_precedente, semaine, productivite_s1,
+        )
+        pdf_name = f"Podium Performance Drive S{week}.pdf"
+        pdf_path = os.path.join(work_dir, pdf_name)
+        gen_lib.generate_podium_pdf(
+            pdf_path, week, employee_productivity,
+            taux_actuelle=taux_actuelle, taux_precedente=taux_precedente,
+        )
+        return FileResponse(
+            pdf_path,
+            filename=pdf_name,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{pdf_name}"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la génération du podium : {e}")

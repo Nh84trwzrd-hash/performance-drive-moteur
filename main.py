@@ -326,3 +326,4 @@ async def generate_package(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur lors de la génération vérifiée : {e}")
+    

@@ -63,6 +63,20 @@ def get_week_and_employees(path):
     return week, employees
 
 
+def get_periode(path):
+    """Renvoie (date_debut, date_fin) de la periode reellement couverte par
+    le fichier Preparation (cellule "Du DD/MM/YYYY Au DD/MM/YYYY"). Renvoie
+    (None, None) si le format n'est pas reconnu."""
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb['Preparation']
+    periode = ws.cell(row=5, column=3).value
+    m = re.search(r'Du (\d{2})/(\d{2})/(\d{4}) [Aa]u (\d{2})/(\d{2})/(\d{4})', periode or '')
+    if not m:
+        return None, None
+    d1, mo1, y1, d2, mo2, y2 = (int(g) for g in m.groups())
+    return datetime.date(y1, mo1, d1), datetime.date(y2, mo2, d2)
+
+
 # ---------------------------------------------------------------------------
 # Extraction des heures "Drive" depuis un planning PDF (format Boulpat/Drive/Bazar)
 # ---------------------------------------------------------------------------
@@ -112,20 +126,89 @@ def _group_tags(tags_row, gap_threshold=8.0):
     return groups
 
 
-def parse_planning_pdf(pdf_path, department='DRIVE'):
+_WEEKDAYS = {"Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"}
+_DATE_DM_RE = re.compile(r'^(\d{2})/(\d{2})$')
+
+
+def _extract_day_columns(page):
+    """Retourne une liste [(x0_debut_colonne, date), ...] triee par x0, une
+    entree par jour de la semaine affiche sur cette page du planning (en se
+    basant sur les colonnes "Lundi 29/06", "Mardi 30/06", ... et le sous-en-tete
+    "Matin" qui marque le debut de chaque colonne jour). Retourne [] si les
+    en-tetes attendus ne sont pas trouves (le filtrage par date est alors
+    simplement desactive, sans erreur)."""
+    words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
+    header_words = [w for w in words if w['top'] < 90]
+    if not header_words:
+        return []
+
+    header_text = ' '.join(w['text'] for w in sorted(header_words, key=lambda w: (w['top'], w['x0'])))
+    year_m = re.search(r'(\d{2})/(\d{2})/(\d{4})', header_text)
+    if not year_m:
+        return []
+    year = int(year_m.group(3))
+
+    day_row = sorted([w for w in words if 60 <= w['top'] <= 75], key=lambda w: w['x0'])
+    dates = []
+    i = 0
+    while i < len(day_row):
+        w = day_row[i]
+        if w['text'] in _WEEKDAYS and i + 1 < len(day_row):
+            dm = _DATE_DM_RE.match(day_row[i + 1]['text'])
+            if dm:
+                try:
+                    dates.append(datetime.date(year, int(dm.group(2)), int(dm.group(1))))
+                except ValueError:
+                    dates.append(None)
+                i += 2
+                continue
+        i += 1
+
+    matin_row = sorted(
+        [w for w in words if 76 <= w['top'] <= 85 and w['text'] == 'Matin'],
+        key=lambda w: w['x0'])
+    starts = [w['x0'] for w in matin_row]
+
+    if not starts or len(starts) != len(dates) or any(d is None for d in dates):
+        return []
+    return list(zip(starts, dates))
+
+
+def _date_for_x(x0, day_columns):
+    """Renvoie la date de la colonne jour dans laquelle x0 tombe, a partir
+    d'une liste [(x0_debut, date), ...] triee par x0 croissant."""
+    chosen = None
+    for start_x, d in day_columns:
+        if x0 >= start_x - 3:
+            chosen = d
+        else:
+            break
+    return chosen
+
+
+def parse_planning_pdf(pdf_path, department='DRIVE', date_start=None, date_end=None):
     """Lit un planning hebdomadaire (format Boulpat/Drive/Bazar) et retourne un
     dict {nom_planning: heures_decimales} ne comptabilisant que les heures
     dont le rayon affecté correspond exactement a `department` (ex: DRIVE).
     Les employes absents toute la semaine (maladie/accident) ou n'ayant
-    jamais travaille sur ce rayon obtiennent 0."""
+    jamais travaille sur ce rayon obtiennent 0.
+
+    Si date_start/date_end sont fournis (periode reelle du fichier
+    Preparation), seules les heures dont la colonne jour du planning tombe
+    dans cette periode sont comptabilisees — utile quand le planning couvre
+    une semaine calendaire complete (ex: Lundi a Dimanche) mais que le suivi
+    de productivite ne porte que sur une partie de cette semaine (ex:
+    Mercredi a Dimanche pour la premiere semaine d'un nouveau cycle)."""
     if pdfplumber is None:
         raise RuntimeError("pdfplumber n'est pas installe: impossible de lire le planning PDF.")
 
-    blocks = []
+    result = {}
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
             rows = _cluster_rows(words)
+            day_columns = _extract_day_columns(page) if (date_start or date_end) else []
+
             name_rows_idx = [
                 i for i, r in enumerate(rows)
                 if r[0]['x0'] < 135 and _NAME_RE.match(r[0]['text']) and len(r[0]['text']) >= 2 and r[0]['top'] > 85
@@ -134,33 +217,38 @@ def parse_planning_pdf(pdf_path, department='DRIVE'):
                 end_idx = name_rows_idx[bi + 1] if bi + 1 < len(name_rows_idx) else len(rows)
                 block_rows = rows[idx:end_idx]
                 name_tokens = [w['text'] for w in block_rows[0] if w['x0'] < 135]
-                blocks.append((' '.join(name_tokens), block_rows))
+                name = ' '.join(name_tokens)
 
-    result = {}
-    for name, block_rows in blocks:
-        hours_row, tags_row = None, None
-        for r in block_rows:
-            toks = [w['text'] for w in r]
-            if toks and all(_HOUR_RE.match(t) for t in toks) and r[0]['x0'] >= 135:
-                hours_row = r
-            elif toks and all(t in _REPOS_TOKENS for t in toks):
-                pass
-            elif toks and all(_NAME_RE.match(t) for t in toks) and r[0]['x0'] >= 135:
-                tags_row = r
+                hours_row, tags_row = None, None
+                for r in block_rows:
+                    toks = [w['text'] for w in r]
+                    if toks and all(_HOUR_RE.match(t) for t in toks) and r[0]['x0'] >= 135:
+                        hours_row = r
+                    elif toks and all(t in _REPOS_TOKENS for t in toks):
+                        pass
+                    elif toks and all(_NAME_RE.match(t) for t in toks) and r[0]['x0'] >= 135:
+                        tags_row = r
 
-        if not hours_row:
-            result[name] = 0.0
-            continue
+                if not hours_row:
+                    result[name] = 0.0
+                    continue
 
-        hour_tokens = sorted(hours_row, key=lambda w: w['x0'])
-        groups = _group_tags(tags_row) if tags_row else []
+                hour_tokens = sorted(hours_row, key=lambda w: w['x0'])
+                groups = _group_tags(tags_row) if tags_row else []
 
-        dept_hours = 0.0
-        for i, htok in enumerate(hour_tokens):
-            tag = groups[i]['text'].strip().upper() if i < len(groups) else None
-            if tag == department.upper():
-                dept_hours += _hour_to_decimal(htok['text'])
-        result[name] = round(dept_hours, 2)
+                dept_hours = 0.0
+                for i, htok in enumerate(hour_tokens):
+                    tag = groups[i]['text'].strip().upper() if i < len(groups) else None
+                    if tag != department.upper():
+                        continue
+                    if day_columns:
+                        d = _date_for_x(htok['x0'], day_columns)
+                        if d is not None and date_start is not None and d < date_start:
+                            continue
+                        if d is not None and date_end is not None and d > date_end:
+                            continue
+                    dept_hours += _hour_to_decimal(htok['text'])
+                result[name] = round(dept_hours, 2)
 
     return result
 
@@ -222,10 +310,16 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     est un dict {matricule: productivite_h_decimale} pour cette semaine,
     a persister pour servir de S-1 la semaine suivante."""
     week, employees = get_week_and_employees(path)
+    periode_debut, periode_fin = get_periode(path)
 
     hours_map = {}
     if planning_path:
-        planning_hours = parse_planning_pdf(planning_path)
+        # Ne compter que les heures DRIVE dont la date tombe dans la periode
+        # reellement couverte par le fichier Preparation : le planning peut
+        # afficher une semaine calendaire complete (Lundi-Dimanche) alors que
+        # le suivi de productivite ne porte que sur une partie de celle-ci
+        # (ex: premiere semaine d'un cycle qui demarre un mercredi).
+        planning_hours = parse_planning_pdf(planning_path, date_start=periode_debut, date_end=periode_fin)
         hours_map = match_planning_hours(planning_hours, [e[0] for e in employees])
 
     productivite_s1 = productivite_s1 or {}

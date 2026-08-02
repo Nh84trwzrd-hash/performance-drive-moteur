@@ -82,6 +82,12 @@ def get_periode(path):
 # ---------------------------------------------------------------------------
 
 _NAME_RE = re.compile(r'^[A-ZÀ-Ÿ\-]+$')
+# Certains intitules de rayon contiennent un "/" (ex: "ECOLE/FORMATION") : une
+# regex n'autorisant pas ce caractere fait echouer la reconnaissance de toute
+# la ligne de tags rayon pour l'employe concerne, et ses heures DRIVE reelles
+# sont alors silencieusement comptees comme 0 (aucun tag ne peut alors
+# correspondre a "DRIVE" puisque la ligne entiere est rejetee).
+_TAG_RE = re.compile(r'^[A-ZÀ-Ÿ\-/]+$')
 _HOUR_RE = re.compile(r'^\d{1,2}h\d{2}$')
 _REPOS_TOKENS = {"REPOS", "MALADIE", "ACCIDENT", "CP"}
 _NOISE_TOKENS = {
@@ -136,7 +142,18 @@ def _extract_day_columns(page):
     basant sur les colonnes "Lundi 29/06", "Mardi 30/06", ... et le sous-en-tete
     "Matin" qui marque le debut de chaque colonne jour). Retourne [] si les
     en-tetes attendus ne sont pas trouves (le filtrage par date est alors
-    simplement desactive, sans erreur)."""
+    simplement desactive, sans erreur).
+
+    NB: la position verticale (top) de ces en-tetes n'est PAS fixe d'une page
+    a l'autre du meme PDF : certains plannings multi-pages redecalent
+    legerement tout le contenu sur les pages suivantes (quelques points de
+    plus ou de moins). D'anciennes bornes verticales absolues (ex: "60 <= top
+    <= 75") marchaient sur la page 1 mais ratissaient a cote sur la page 2+,
+    desactivant silencieusement le filtrage par date pour les employes situes
+    sur ces pages-la (leurs heures redevenaient alors comptees sur TOUTE la
+    semaine du planning au lieu de la seule periode Preparation). On localise
+    donc ces en-tetes dynamiquement, relativement les uns aux autres, plutot
+    que par une position absolue sur la page."""
     words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
     header_words = [w for w in words if w['top'] < 90]
     if not header_words:
@@ -148,7 +165,16 @@ def _extract_day_columns(page):
         return []
     year = int(year_m.group(3))
 
-    day_row = sorted([w for w in words if 60 <= w['top'] <= 75], key=lambda w: w['x0'])
+    # Ligne des jours ("Lundi 29/06", ...) : on la localise via le top des
+    # noms de jours eux-memes (une seule occurrence de chaque jour sur la
+    # page), sans supposer sa position absolue.
+    weekday_tops = sorted({round(w['top'], 1) for w in words if w['text'] in _WEEKDAYS})
+    if not weekday_tops:
+        return []
+    day_top = weekday_tops[0]
+    day_row = sorted(
+        [w for w in words if abs(w['top'] - day_top) <= 2.5],
+        key=lambda w: w['x0'])
     dates = []
     i = 0
     while i < len(day_row):
@@ -164,8 +190,16 @@ def _extract_day_columns(page):
                 continue
         i += 1
 
+    # Sous-en-tete "Matin" : toujours quelques points sous la ligne des jours
+    # (observe ~11pt plus bas), mais ce decalage peut legerement varier d'une
+    # page a l'autre -> on prend la ligne de "Matin" la plus proche sous
+    # day_top plutot qu'une fenetre absolue fixe.
+    matin_candidates = [w for w in words if w['text'] == 'Matin' and w['top'] > day_top]
+    if not matin_candidates:
+        return []
+    matin_top = min(round(w['top'], 1) for w in matin_candidates)
     matin_row = sorted(
-        [w for w in words if 76 <= w['top'] <= 85 and w['text'] == 'Matin'],
+        [w for w in matin_candidates if abs(w['top'] - matin_top) <= 2.5],
         key=lambda w: w['x0'])
     starts = [w['x0'] for w in matin_row]
 
@@ -226,7 +260,7 @@ def parse_planning_pdf(pdf_path, department='DRIVE', date_start=None, date_end=N
                         hours_row = r
                     elif toks and all(t in _REPOS_TOKENS for t in toks):
                         pass
-                    elif toks and all(_NAME_RE.match(t) for t in toks) and r[0]['x0'] >= 135:
+                    elif toks and all(_TAG_RE.match(t) for t in toks) and r[0]['x0'] >= 135:
                         tags_row = r
 
                 if not hours_row:
@@ -286,13 +320,40 @@ def extract_matricule(name):
     return m.group(1).strip() if m else None
 
 
+# Alias manuels pour les employes dont le nom dans le fichier Preparation ne
+# partage aucun token avec leur nom reel sur le planning (ex: nom d'emprunt /
+# place-holder saisi par erreur), ce que le matching flou (SequenceMatcher)
+# ne peut par construction pas relier puisqu'il n'y a aucune similarite de
+# caracteres a exploiter. Cle: tuple de tokens normalises (voir
+# _normalize_name_tokens) tel que le nom apparait dans la Preparation ->
+# tuple de tokens normalises tel que le nom apparait sur le planning.
+# Ajouter une entree ici des qu'un nouveau cas de ce type est signale.
+NAME_ALIASES = {
+    ('COUETTE', 'COUETTE'): ('GONZALES', 'MANRUBIO', 'J'),
+}
+
+
 def match_planning_hours(planning_hours, employee_names, threshold=0.82):
     """Associe chaque employe (nom tel qu'il figure dans la Preparation) aux
     heures Drive du planning, en tolerant fautes de frappe et ordre nom/prenom
     inverse. Ne renvoie une valeur que pour les employes matches avec un score
-    suffisant ; les autres sont absents du dict retourne (fallback manuel)."""
+    suffisant ; les autres sont absents du dict retourne (fallback manuel).
+
+    Verifie d'abord NAME_ALIASES (match exact garanti pour les cas connus ou
+    le nom Preparation et le nom planning n'ont rien en commun), avant de
+    retomber sur le matching flou pour tous les autres employes."""
+    normalized_planning = {}
+    for plan_name, hours in planning_hours.items():
+        normalized_planning.setdefault(tuple(_normalize_name_tokens(plan_name)), hours)
+
     matched = {}
     for emp_name in employee_names:
+        emp_tokens = tuple(_normalize_name_tokens(emp_name))
+        alias_tokens = NAME_ALIASES.get(emp_tokens)
+        if alias_tokens is not None and alias_tokens in normalized_planning:
+            matched[emp_name] = normalized_planning[alias_tokens]
+            continue
+
         best_score, best_hours = 0.0, None
         for plan_name, hours in planning_hours.items():
             score = _name_match_score(plan_name, emp_name)
@@ -381,27 +442,20 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
             cb.font = blue_font
         cb.number_format = '0.00'
 
-        # C/D/E/F/G : quand les heures (B) sont deja connues (auto-remplies
-        # depuis le planning), on ecrit des valeurs litterales calculees en
-        # Python plutot que des formules — certains lecteurs (Numbers, aperçus)
-        # n'executent pas toujours le recalcul des formules a l'ouverture, ce
-        # qui laissait ces colonnes a 0/vide. Quand B reste manuel (jaune), on
-        # garde les formules d'origine pour un calcul live des que l'utilisateur
-        # saisit une valeur dans Excel.
-        e_value = None
-        if b_value is not None:
-            cc = ws.cell(row=r, column=3, value=articles_count if articles_count is not None else 0)
-            cd = ws.cell(row=r, column=4, value=commandes_count if commandes_count is not None else 0)
-            e_value = (articles_count / b_value) if (articles_count is not None and b_value) else None
-            ce = ws.cell(row=r, column=5, value=e_value)
-            cf = ws.cell(row=r, column=6, value=(e_value / 60) if e_value is not None else None)
-            cg = ws.cell(row=r, column=7, value=(commandes_count / b_value) if (commandes_count is not None and b_value) else None)
-        else:
-            cc = ws.cell(row=r, column=3, value=f"='{prep_sheet_name}'!C{art_row}")
-            cd = ws.cell(row=r, column=4, value=f"='{prep_sheet_name}'!C{prep_row}")
-            ce = ws.cell(row=r, column=5, value=f"=IFERROR(C{r}/B{r},\"\")")
-            cf = ws.cell(row=r, column=6, value=f"=IFERROR(E{r}/60,\"\")")
-            cg = ws.cell(row=r, column=7, value=f"=IFERROR(D{r}/B{r},\"\")")
+        # C/D/E/F/G : toujours des formules Excel live (references a la feuille
+        # Preparation et a la colonne B), meme quand B est deja auto-rempli
+        # depuis le planning. Ainsi, si l'utilisateur modifie une heure (ou
+        # tout autre nombre) dans Excel, la productivite et le graphique se
+        # recalculent automatiquement. Le fichier livre est tout de meme
+        # recalcule cote serveur (LibreOffice) avant envoi, donc les valeurs
+        # mises en cache sont correctes des l'ouverture, meme dans un lecteur
+        # qui n'executerait pas le recalcul automatiquement.
+        e_value = (articles_count / b_value) if (articles_count is not None and b_value) else None
+        cc = ws.cell(row=r, column=3, value=f"='{prep_sheet_name}'!C{art_row}")
+        cd = ws.cell(row=r, column=4, value=f"='{prep_sheet_name}'!C{prep_row}")
+        ce = ws.cell(row=r, column=5, value=f"=IFERROR(C{r}/B{r},\"\")")
+        cf = ws.cell(row=r, column=6, value=f"=IFERROR(E{r}/60,\"\")")
+        cg = ws.cell(row=r, column=7, value=f"=IFERROR(D{r}/B{r},\"\")")
         cc.font = Font(name=arial, color='008000')
         cd.font = Font(name=arial, color='008000')
         ce.font = Font(name=arial)
@@ -426,35 +480,25 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
 
         # % Evolution vs S-1 : difference entre Productivite/H (E, semaine
         # actuelle) et Productivite/H S-1 (H), exprimee en % de la valeur
-        # ACTUELLE (E) — donc (E-H)/E*100, pas /H.
-        evo_pct, evo_up = None, None
-        ci = ws.cell(row=r, column=9)
-        if e_value is not None and h_value is not None and e_value != 0:
-            evo_up = e_value >= h_value
-            evo_pct = round(abs(e_value - h_value) / e_value * 100, 1)
-            arrow = '▲ ' if evo_up else '▼ '
-            ci.value = f"{arrow}{evo_pct}%"
-        elif b_value is not None and h_value is not None and e_value == 0:
-            # Division par zero (productivite actuelle = 0) : rien de comparable.
-            ci.value = ""
-        elif b_value is not None and h_value is None:
-            # B connu mais S-1 pas encore disponible : rien a comparer.
-            ci.value = ""
-        else:
-            ci.value = (f"=IFERROR(IF(OR(E{r}=\"\",H{r}=\"\"),\"\",IF(E{r}>=H{r},\"▲ \",\"▼ \")"
-                        f"&ROUND(ABS(E{r}-H{r})/E{r}*100,1)&\"%\"),\"\")")
+        # ACTUELLE (E) — donc (E-H)/E*100, pas /H. Toujours une formule live
+        # (meme raison que C-G ci-dessus : rester dynamique si l'utilisateur
+        # modifie les heures ou la productivite S-1 dans Excel).
+        ci = ws.cell(row=r, column=9,
+                      value=(f"=IFERROR(IF(OR(E{r}=\"\",H{r}=\"\"),\"\",IF(E{r}>=H{r},\"▲ \",\"▼ \")"
+                             f"&ROUND(ABS(E{r}-H{r})/E{r}*100,1)&\"%\"),\"\")"))
         ci.font = Font(name=arial, bold=True)
         ci.alignment = Alignment(horizontal='center')
 
         # Productivite calculee cette semaine (pour servir de S-1 la semaine prochaine)
+        # -- calcul Python interne uniquement, n'affecte pas les cellules ecrites.
         if matricule and b_value and articles_count is not None:
             entry = {
                 'nom': name,
                 'productivite_h': round(articles_count / b_value, 2),
             }
-            if evo_pct is not None:
-                entry['evolution_pct'] = evo_pct
-                entry['evolution_up'] = evo_up
+            if e_value is not None and h_value is not None and e_value != 0:
+                entry['evolution_pct'] = round(abs(e_value - h_value) / e_value * 100, 1)
+                entry['evolution_up'] = e_value >= h_value
             employee_productivity_this_week[matricule] = entry
 
     headers2 = ['Productivité /H S-1', '% Évolution vs S-1']
@@ -700,6 +744,11 @@ def build_ranking(employee_productivity, excluded_matricules=None):
             continue
         if data.get('productivite_h') is None:
             continue
+        if data.get('productivite_h') <= 0:
+            # Un 0h signale presque toujours une anomalie de matricule (ex: la
+            # meme personne saisie sous deux matricules differents une
+            # semaine donnee) plutot qu'un veritable collaborateur a classer.
+            continue
         rows.append({
             'matricule': matricule,
             'name': _pdm_clean_name(data.get('nom', matricule)),
@@ -768,7 +817,11 @@ def generate_podium_pdf(pdf_path, week, employee_productivity, taux_actuelle=Non
     c.setFont("Helvetica-Bold", 13)
     ptw = _rl_stringWidth(pill_label, "Helvetica-Bold", 13)
     pw, ph = ptw + 28, 30
-    px, py = W - 36 - pw, H - header_h / 2 - ph / 2
+    # Ancre en haut a droite (aligne sur le titre de l'enseigne) plutot que
+    # centre sur toute la hauteur de l'entete : evite qu'il ne vienne
+    # frotter contre le bandeau "PERFORMANCE DRIVE" en dessous, quelle que
+    # soit la longueur du nom d'enseigne/magasin.
+    px, py = W - 36 - pw, H - 34 - ph
     _pdm_rounded_card(c, px, py, pw, ph, RED, radius=15)
     c.setFillColor(WHITE)
     c.drawCentredString(px + pw / 2, py + ph / 2 - 5, pill_label)
@@ -823,10 +876,58 @@ def generate_podium_pdf(pdf_path, week, employee_productivity, taux_actuelle=Non
 
     list_top = baseline - max(bar_h_map.values()) - 22
 
-    # ---- Classement 4e et suivants
-    row_h = 24
+    # ---- Blocs du bas (taux de rupture + ruban meilleure progression),
+    # ancres depuis le BAS de la page plutot que depuis le contenu du
+    # dessus : le nombre de lignes du classement et la presence ou non
+    # d'un ruban varient d'une semaine a l'autre, et un positionnement
+    # "en cascade" depuis le haut laissait soit un grand vide (peu de
+    # lignes / pas de ruban -> semaine 27), soit un chevauchement avec le
+    # pied de page (beaucoup de lignes -> semaine 28). En ancrant ces deux
+    # blocs depuis le bas, ils restent toujours a une position fixe et
+    # lisible, quel que soit le contenu du classement.
+    footer_h = 34
+    bottom_margin = 20
+    taux_h = 108
+    ribbon_h = 46
+
+    positive = [p for p in ranking if p["up"]]
+    has_ribbon = bool(positive)
+
+    box_y = footer_h + bottom_margin
+    if has_ribbon:
+        ribbon_y = box_y
+        box_y = ribbon_y + ribbon_h + 16
+    box_top = box_y + taux_h
+
+    # ---- Classement 4e et suivants : la table occupe tout l'espace
+    # disponible entre le podium et le bloc du bas, avec une hauteur de
+    # ligne qui s'adapte (dans des bornes raisonnables) pour ne jamais se
+    # chevaucher avec le bas de page ni laisser un vide disproportionne.
     header_row_h = 22
     list_rows = ranking[3:]
+    available = list_top - 24 - box_top
+    if list_rows:
+        # Le plancher precedent (22) etait plus grand que "available" des
+        # qu'il y avait beaucoup de collaborateurs classes (ex: semaine 28,
+        # 8 collaborateurs -> 5 lignes hors podium) : la table debordait
+        # alors mecaniquement sur le bloc "Taux de rupture" en dessous,
+        # quel que soit son contenu. Le plancher doit rester en-dessous de
+        # ce que "available" peut effectivement fournir ; 12pt reste
+        # lisible pour une table dense, et le texte est recentre/reduit
+        # dynamiquement ci-dessous quand row_h retrecit.
+        row_h = max(12, min(34, (available - header_row_h) / len(list_rows)))
+    else:
+        row_h = 24
+    # Taille de police et decalage vertical du texte adaptes a row_h, pour
+    # que chaque ligne reste lisible et centree meme quand la table est
+    # tres dense (beaucoup de collaborateurs classes une semaine donnee).
+    if row_h >= 20:
+        row_font = 10
+    elif row_h >= 16:
+        row_font = 9
+    else:
+        row_font = 7.5
+    text_y_offset = max(3, min(8, row_h / 2 + row_font / 2 - 2))
     y = list_top
     c.setFillColor(RED)
     c.rect(36, y - header_row_h, W - 72, header_row_h, fill=1, stroke=0)
@@ -845,63 +946,64 @@ def generate_podium_pdf(pdf_path, week, employee_productivity, taux_actuelle=Non
             c.setFillColor(GREY_BG)
             c.rect(36, row_y, W - 72, row_h, fill=1, stroke=0)
         c.setFillColor(BLACK)
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(50, row_y + 8, f"{rank}e")
-        c.setFont("Helvetica", 10)
-        c.drawString(100, row_y + 8, p["name"])
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(360, row_y + 8, f"{p['prod']:.1f} art./h")
+        c.setFont("Helvetica-Bold", row_font)
+        c.drawString(50, row_y + text_y_offset, f"{rank}e")
+        c.setFont("Helvetica", row_font)
+        c.drawString(100, row_y + text_y_offset, p["name"])
+        c.setFont("Helvetica-Bold", row_font)
+        c.drawString(360, row_y + text_y_offset, f"{p['prod']:.1f} art./h")
         if p["evo"] is None:
             c.setFillColor(GREY_PILL)
-            c.drawString(480, row_y + 8, "NOUVEAU")
+            c.drawString(480, row_y + text_y_offset, "NOUVEAU")
         else:
             arrow = "▲" if p["up"] else "▼"
             c.setFillColor(GREEN if p["up"] else RED_NEG)
-            c.drawString(480, row_y + 8, f"{arrow} {p['evo']:.1f}%")
+            c.drawString(480, row_y + text_y_offset, f"{arrow} {p['evo']:.1f}%")
         y = row_y
 
-    list_bottom = y
-
-    # ---- Taux de rupture
-    taux_h = 108
-    box_y = list_bottom - 24 - taux_h
+    # ---- Taux de rupture (position deja fixee plus haut, ancree sur le
+    # bas de page : voir box_y/ribbon_y calcules avant la table)
     _pdm_rounded_card(c, 36, box_y, W - 72, taux_h, BLACK, radius=12)
     c.setFillColor(RED)
     c.setFont("Helvetica-Bold", 13)
     c.drawCentredString(W / 2, box_y + taux_h - 24, "TAUX DE RUPTURE")
 
     half_w = (W - 72) / 2
-    ts1 = taux_precedente if taux_precedente is not None else 0.0
     tac = taux_actuelle if taux_actuelle is not None else 0.0
     _pdm_center_text(c, "SEMAINE PRÉCÉDENTE (S-1)", 36 + half_w / 2, box_y + taux_h - 50, "Helvetica", 9, _rl_colors.HexColor('#BBBBBB'))
-    _pdm_center_text(c, f"{ts1*100:.2f}%", 36 + half_w / 2, box_y + 22, "Helvetica-Bold", 26, WHITE)
+    if taux_precedente is None:
+        _pdm_center_text(c, "N/D", 36 + half_w / 2, box_y + 22, "Helvetica-Bold", 26, _rl_colors.HexColor('#777777'))
+    else:
+        _pdm_center_text(c, f"{taux_precedente*100:.2f}%", 36 + half_w / 2, box_y + 22, "Helvetica-Bold", 26, WHITE)
     _pdm_center_text(c, "CETTE SEMAINE", 36 + half_w + half_w / 2, box_y + taux_h - 50, "Helvetica", 9, _rl_colors.HexColor('#BBBBBB'))
-    delta = tac - ts1
-    worse = delta > 0
-    delta_color = RED_NEG if worse else GREEN
+
+    ts1 = taux_precedente
+    delta = (tac - ts1) if ts1 is not None else None
+    worse = delta is not None and delta > 0
+    delta_color = (RED_NEG if worse else GREEN) if delta is not None else WHITE
     _pdm_center_text(c, f"{tac*100:.2f}%", 36 + half_w + half_w / 2, box_y + 22, "Helvetica-Bold", 26, delta_color)
 
     c.setStrokeColor(_rl_colors.HexColor('#444444'))
     c.setLineWidth(1)
     c.line(36 + half_w, box_y + 14, 36 + half_w, box_y + taux_h - 40)
 
-    delta_label = f"{'+' if worse else ''}{delta*100:.2f} pt {'▲' if worse else '▼'}"
-    c.setFont("Helvetica-Bold", 10)
-    dtw = _rl_stringWidth(delta_label, "Helvetica-Bold", 10)
-    dpw = dtw + 20
-    _pdm_rounded_card(c, W / 2 - dpw / 2, box_y + taux_h - 46, dpw, 17, delta_color, radius=8)
-    c.setFillColor(WHITE)
-    c.drawCentredString(W / 2, box_y + taux_h - 46 + 4.5, delta_label)
+    if delta is not None:
+        delta_label = f"{'+' if worse else ''}{delta*100:.2f} pt {'▲' if worse else '▼'}"
+        c.setFont("Helvetica-Bold", 10)
+        dtw = _rl_stringWidth(delta_label, "Helvetica-Bold", 10)
+        dpw = dtw + 20
+        _pdm_rounded_card(c, W / 2 - dpw / 2, box_y + taux_h - 46, dpw, 17, delta_color, radius=8)
+        c.setFillColor(WHITE)
+        c.drawCentredString(W / 2, box_y + taux_h - 46 + 4.5, delta_label)
 
-    # ---- Meilleure progression
-    positive = [p for p in ranking if p["up"]]
-    if positive:
+    # ---- Meilleure progression (position deja fixee plus haut : ribbon_y
+    # n'existe que si has_ribbon est vrai)
+    if has_ribbon:
         best = max(positive, key=lambda p: p["evo"])
-        ribbon_y = box_y - 20 - 46
-        _pdm_rounded_card(c, 36, ribbon_y, W - 72, 46, RED, radius=10)
+        _pdm_rounded_card(c, 36, ribbon_y, W - 72, ribbon_h, RED, radius=10)
         c.setFillColor(WHITE)
         c.setFont("Helvetica-Bold", 12)
-        c.drawCentredString(W / 2, ribbon_y + 46 / 2 + 4,
+        c.drawCentredString(W / 2, ribbon_y + ribbon_h / 2 + 4,
                              f"★ MEILLEURE PROGRESSION DE LA SEMAINE : {best['name']} (▲ {best['evo']:.1f}%)")
 
     # ---- Footer

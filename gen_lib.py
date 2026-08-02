@@ -7,11 +7,28 @@ from openpyxl.chart.text import RichText
 from openpyxl.drawing.text import CharacterProperties, Paragraph, ParagraphProperties, RichTextProperties
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.chart.data_source import StrRef, AxDataSource
+from openpyxl.chart.series import DataPoint
+from openpyxl.chart.shapes import GraphicalProperties
 
 try:
     import pdfplumber
 except ImportError:
     pdfplumber = None
+
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas as _rl_canvas
+    from reportlab.lib import colors as _rl_colors
+    from reportlab.pdfbase.pdfmetrics import stringWidth as _rl_stringWidth
+except ImportError:
+    _rl_canvas = None
+
+# Matricules exclus du classement/podium car responsables (pas des collaborateurs
+# a classer). A adapter si l'organisation change.
+EXCLUDED_FROM_RANKING = {
+    "MONTESCOT3",   # Adrien Navaro - responsable
+    "PR0911201",    # Maelle Gendre - responsable
+}
 
 
 def get_week_and_employees(path):
@@ -316,11 +333,13 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
         # % Evolution vs S-1 : difference entre Productivite/H (E, semaine
         # actuelle) et Productivite/H S-1 (H), exprimee en % de la valeur
         # ACTUELLE (E) — donc (E-H)/E*100, pas /H.
+        evo_pct, evo_up = None, None
         ci = ws.cell(row=r, column=9)
         if e_value is not None and h_value is not None and e_value != 0:
-            arrow = '▲ ' if e_value >= h_value else '▼ '
-            pct = round(abs(e_value - h_value) / e_value * 100, 1)
-            ci.value = f"{arrow}{pct}%"
+            evo_up = e_value >= h_value
+            evo_pct = round(abs(e_value - h_value) / e_value * 100, 1)
+            arrow = '▲ ' if evo_up else '▼ '
+            ci.value = f"{arrow}{evo_pct}%"
         elif b_value is not None and h_value is not None and e_value == 0:
             # Division par zero (productivite actuelle = 0) : rien de comparable.
             ci.value = ""
@@ -335,10 +354,14 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
 
         # Productivite calculee cette semaine (pour servir de S-1 la semaine prochaine)
         if matricule and b_value and articles_count is not None:
-            employee_productivity_this_week[matricule] = {
+            entry = {
                 'nom': name,
                 'productivite_h': round(articles_count / b_value, 2),
             }
+            if evo_pct is not None:
+                entry['evolution_pct'] = evo_pct
+                entry['evolution_up'] = evo_up
+            employee_productivity_this_week[matricule] = entry
 
     headers2 = ['Productivité /H S-1', '% Évolution vs S-1']
     for i, h in enumerate(headers2):
@@ -446,6 +469,24 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     chart.set_categories(cats)
     cat_str_ref = StrRef(f=str(cats))
     chart.series[0].cat = AxDataSource(strRef=cat_str_ref)
+
+    # Une couleur distincte par employe (barre), plutot qu'une seule couleur
+    # pour toute la serie.
+    palette = [
+        '4472C4', 'ED7D31', 'A5A5A5', 'FFC000', '5B9BD5', '70AD47',
+        '264478', '9E480E', '636363', '997300', '255E91', '43682B',
+        'C00000', '7030A0', '00B0F0', 'FF66CC', '00B050', 'BF8F00',
+        '203864', '833C00',
+    ]
+    chart.series[0].graphicalProperties.varyColors = True
+    data_points = []
+    for idx in range(n):
+        color = palette[idx % len(palette)]
+        dp = DataPoint(idx=idx)
+        dp.graphicalProperties = GraphicalProperties(solidFill=color)
+        data_points.append(dp)
+    chart.series[0].data_points = data_points
+
     chart.dLbls = DataLabelList()
     chart.dLbls.showVal = True
     chart.dLbls.showLegendKey = False
@@ -467,3 +508,319 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     wb.calculation.fullCalcOnLoad = True
     wb.save(outpath)
     return week, n, employee_productivity_this_week
+
+
+# ---------------------------------------------------------------------------
+# PDF "Podium" - affichage visuel hebdomadaire (charte Intermarché) a afficher
+# en salle de pause. Design valide avec Adrien le 02/08/2026.
+# ---------------------------------------------------------------------------
+
+_PDM_RED = None
+_PDM_BLACK = None
+
+
+def _pdm_colors():
+    global _PDM_RED, _PDM_BLACK
+    if _PDM_RED is None:
+        _PDM_RED = _rl_colors.HexColor('#E2001A')
+        _PDM_BLACK = _rl_colors.HexColor('#1A1A1A')
+    return _PDM_RED, _PDM_BLACK
+
+
+def _pdm_rounded_card(c, x, y, w, h, fill, stroke=None, radius=10, stroke_width=1.2):
+    c.saveState()
+    c.setFillColor(fill)
+    if stroke:
+        c.setStrokeColor(stroke)
+        c.setLineWidth(stroke_width)
+        c.roundRect(x, y, w, h, radius, fill=1, stroke=1)
+    else:
+        c.roundRect(x, y, w, h, radius, fill=1, stroke=0)
+    c.restoreState()
+
+
+def _pdm_center_text(c, text, cx, y, font, size, color):
+    c.setFont(font, size)
+    c.setFillColor(color)
+    c.drawCentredString(cx, y, text)
+
+
+def _pdm_evolution_pill(c, cx, y, up, pct, WHITE, GREEN, RED_NEG, GREY):
+    if pct is None:
+        label, color = "NOUVEAU", GREY
+    else:
+        label = f"{'▲' if up else '▼'} {pct:.1f}%"
+        color = GREEN if up else RED_NEG
+    c.setFont("Helvetica-Bold", 10)
+    tw = _rl_stringWidth(label, "Helvetica-Bold", 10)
+    pad = 10
+    pw, ph = tw + 2 * pad, 18
+    _pdm_rounded_card(c, cx - pw / 2, y, pw, ph, color, radius=9)
+    c.setFillColor(WHITE)
+    c.drawCentredString(cx, y + 5, label)
+
+
+def _pdm_medal_circle(c, cx, cy, r, color, text, WHITE):
+    c.setFillColor(color)
+    c.circle(cx, cy, r, fill=1, stroke=0)
+    c.setFillColor(WHITE)
+    c.setFont("Helvetica-Bold", r * 0.85)
+    c.drawCentredString(cx, cy - r * 0.32, text)
+
+
+def _pdm_logo_mark(c, x, y, size, RED, WHITE):
+    """Badge enseigne : carre rouge arrondi + panier stylise (icone generique)."""
+    _pdm_rounded_card(c, x, y, size, size, RED, radius=size * 0.22)
+    c.saveState()
+    cx, cy = x + size / 2, y + size / 2 - size * 0.04
+    c.setStrokeColor(WHITE)
+    c.setLineWidth(size * 0.055)
+    c.arc(cx - size * 0.16, cy + size * 0.02, cx + size * 0.16, cy + size * 0.32, 0, 180)
+    basket_w, basket_h = size * 0.46, size * 0.24
+    bx, by = cx - basket_w / 2, cy - basket_h / 2
+    p = c.beginPath()
+    p.moveTo(bx + basket_w * 0.08, by + basket_h)
+    p.lineTo(bx, by)
+    p.lineTo(bx + basket_w, by)
+    p.lineTo(bx + basket_w * 0.92, by + basket_h)
+    p.close()
+    c.setFillColor(WHITE)
+    c.drawPath(p, fill=1, stroke=0)
+    c.circle(bx + basket_w * 0.2, by - size * 0.05, size * 0.035, fill=1, stroke=0)
+    c.circle(bx + basket_w * 0.8, by - size * 0.05, size * 0.035, fill=1, stroke=0)
+    c.restoreState()
+
+
+def _pdm_clean_name(nom):
+    base = re.sub(r'\([^)]*\)', '', nom).strip()
+    return base.title()
+
+
+def build_ranking(employee_productivity, excluded_matricules=None):
+    """Construit la liste classee (desc. par productivite_h) a partir du dict
+    retourne par build(), en excluant les responsables."""
+    excluded = excluded_matricules if excluded_matricules is not None else EXCLUDED_FROM_RANKING
+    rows = []
+    for matricule, data in (employee_productivity or {}).items():
+        if matricule in excluded:
+            continue
+        if data.get('productivite_h') is None:
+            continue
+        rows.append({
+            'matricule': matricule,
+            'name': _pdm_clean_name(data.get('nom', matricule)),
+            'prod': data['productivite_h'],
+            'evo': data.get('evolution_pct'),
+            'up': data.get('evolution_up'),
+        })
+    rows.sort(key=lambda r: r['prod'], reverse=True)
+    return rows
+
+
+def generate_podium_pdf(pdf_path, week, employee_productivity, taux_actuelle=None,
+                         taux_precedente=None, enseigne="INTERMARCHÉ", magasin="MONTESCOT",
+                         excluded_matricules=None):
+    """Genere le PDF "podium" hebdomadaire (charte Intermarche) a partir des
+    resultats de build(). Retourne le nombre de collaborateurs classes."""
+    if _rl_canvas is None:
+        raise RuntimeError("reportlab n'est pas installe: impossible de generer le PDF podium.")
+
+    RED, BLACK = _pdm_colors()
+    WHITE = _rl_colors.white
+    GOLD = _rl_colors.HexColor('#D9A400')
+    SILVER = _rl_colors.HexColor('#9AA0A6')
+    BRONZE = _rl_colors.HexColor('#B5651D')
+    GREEN = _rl_colors.HexColor('#1E7B34')
+    RED_NEG = _rl_colors.HexColor('#C62828')
+    GREY_BG = _rl_colors.HexColor('#F3F3F3')
+    GREY_TXT = _rl_colors.HexColor('#5B5B5B')
+    GREY_PILL = _rl_colors.HexColor('#9E9E9E')
+
+    ranking = build_ranking(employee_productivity, excluded_matricules)
+    W, H = A4
+    c = _rl_canvas.Canvas(pdf_path, pagesize=A4)
+
+    # ---- Header
+    header_h = 108
+    c.setFillColor(BLACK)
+    c.rect(0, H - header_h, W, header_h, fill=1, stroke=0)
+    c.setFillColor(RED)
+    c.rect(0, H - header_h - 6, W, 6, fill=1, stroke=0)
+
+    logo_size = 52
+    logo_x, logo_y = 36, H - 34 - logo_size
+    _pdm_logo_mark(c, logo_x, logo_y, logo_size, RED, WHITE)
+
+    text_x = logo_x + logo_size + 14
+    c.setFont("Helvetica-Bold", 25)
+    c.setFillColor(WHITE)
+    c.drawString(text_x, H - 46, enseigne)
+    c.setFillColor(RED)
+    tw = _rl_stringWidth(enseigne + " ", "Helvetica-Bold", 25)
+    c.drawString(text_x + tw, H - 46, magasin)
+
+    c.setFont("Helvetica-Bold", 11)
+    band_label = "PERFORMANCE DRIVE"
+    btw = _rl_stringWidth(band_label, "Helvetica-Bold", 11)
+    bpad = 8
+    _pdm_rounded_card(c, text_x, H - 74, btw + 2 * bpad, 17, RED, radius=8)
+    c.setFillColor(WHITE)
+    c.drawString(text_x + bpad, H - 70, band_label)
+    c.setFont("Helvetica", 10)
+    c.setFillColor(_rl_colors.HexColor('#CCCCCC'))
+    c.drawString(text_x + btw + 2 * bpad + 10, H - 70, "Classement hebdomadaire des collaborateurs")
+
+    pill_label = f"SEMAINE {week}"
+    c.setFont("Helvetica-Bold", 13)
+    ptw = _rl_stringWidth(pill_label, "Helvetica-Bold", 13)
+    pw, ph = ptw + 28, 30
+    px, py = W - 36 - pw, H - header_h / 2 - ph / 2
+    _pdm_rounded_card(c, px, py, pw, ph, RED, radius=15)
+    c.setFillColor(WHITE)
+    c.drawCentredString(px + pw / 2, py + ph / 2 - 5, pill_label)
+
+    # ---- Podium top 3
+    podium_top = H - header_h - 18
+    card_w, gap = 152, 14
+    total_w = card_w * 3 + gap * 2
+    start_x = (W - total_w) / 2
+    order = [1, 0, 2]
+    medal_colors = {0: GOLD, 1: SILVER, 2: BRONZE}
+    card_h_map = {0: 172, 1: 148, 2: 148}
+    bar_h_map = {0: 150, 1: 108, 2: 78}
+    baseline = podium_top - 200
+
+    top3 = ranking[:3]
+    for slot, idx in enumerate(order):
+        if idx >= len(top3):
+            continue
+        x = start_x + slot * (card_w + gap)
+        p = top3[idx]
+        card_h = card_h_map[idx]
+        card_y = podium_top - card_h
+        color = medal_colors[idx]
+
+        _pdm_rounded_card(c, x, card_y, card_w, card_h, WHITE, stroke=color, stroke_width=2.2, radius=12)
+        cx = x + card_w / 2
+        _pdm_medal_circle(c, cx, card_y + card_h - 8, 22, color, str(idx + 1), WHITE)
+
+        c.setFont("Helvetica-Bold", 11)
+        name = p["name"]
+        if _rl_stringWidth(name, "Helvetica-Bold", 11) > card_w - 16:
+            parts = name.split(" ", 1)
+            _pdm_center_text(c, parts[0], cx, card_y + card_h - 46, "Helvetica-Bold", 11, BLACK)
+            _pdm_center_text(c, parts[1] if len(parts) > 1 else "", cx, card_y + card_h - 59, "Helvetica-Bold", 11, BLACK)
+            name_bottom = card_y + card_h - 59
+        else:
+            _pdm_center_text(c, name, cx, card_y + card_h - 46, "Helvetica-Bold", 11, BLACK)
+            name_bottom = card_y + card_h - 46
+
+        _pdm_center_text(c, f"{p['prod']:.1f}", cx, name_bottom - 24, "Helvetica-Bold", 20, BLACK)
+        _pdm_center_text(c, "articles / heure", cx, name_bottom - 36, "Helvetica", 7.5, GREY_TXT)
+        _pdm_evolution_pill(c, cx, card_y + 10, p["up"], p["evo"], WHITE, GREEN, RED_NEG, GREY_PILL)
+
+        bar_h = bar_h_map[idx]
+        bar_y = baseline - bar_h
+        c.setFillColor(color)
+        c.rect(x, bar_y, card_w, bar_h, fill=1, stroke=0)
+        c.setFont("Helvetica-Bold", 34)
+        c.setFillColor(WHITE)
+        c.drawCentredString(cx, bar_y + bar_h / 2 - 12, str(idx + 1))
+
+    list_top = baseline - max(bar_h_map.values()) - 22
+
+    # ---- Classement 4e et suivants
+    row_h = 24
+    header_row_h = 22
+    list_rows = ranking[3:]
+    y = list_top
+    c.setFillColor(RED)
+    c.rect(36, y - header_row_h, W - 72, header_row_h, fill=1, stroke=0)
+    c.setFillColor(WHITE)
+    c.setFont("Helvetica-Bold", 9.5)
+    c.drawString(50, y - header_row_h + 7, "RANG")
+    c.drawString(100, y - header_row_h + 7, "COLLABORATEUR")
+    c.drawString(360, y - header_row_h + 7, "PRODUCTIVITÉ /H")
+    c.drawString(480, y - header_row_h + 7, "ÉVOLUTION S-1")
+    y -= header_row_h
+
+    for i, p in enumerate(list_rows):
+        rank = i + 4
+        row_y = y - row_h
+        if i % 2 == 0:
+            c.setFillColor(GREY_BG)
+            c.rect(36, row_y, W - 72, row_h, fill=1, stroke=0)
+        c.setFillColor(BLACK)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(50, row_y + 8, f"{rank}e")
+        c.setFont("Helvetica", 10)
+        c.drawString(100, row_y + 8, p["name"])
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(360, row_y + 8, f"{p['prod']:.1f} art./h")
+        if p["evo"] is None:
+            c.setFillColor(GREY_PILL)
+            c.drawString(480, row_y + 8, "NOUVEAU")
+        else:
+            arrow = "▲" if p["up"] else "▼"
+            c.setFillColor(GREEN if p["up"] else RED_NEG)
+            c.drawString(480, row_y + 8, f"{arrow} {p['evo']:.1f}%")
+        y = row_y
+
+    list_bottom = y
+
+    # ---- Taux de rupture
+    taux_h = 108
+    box_y = list_bottom - 24 - taux_h
+    _pdm_rounded_card(c, 36, box_y, W - 72, taux_h, BLACK, radius=12)
+    c.setFillColor(RED)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawCentredString(W / 2, box_y + taux_h - 24, "TAUX DE RUPTURE")
+
+    half_w = (W - 72) / 2
+    ts1 = taux_precedente if taux_precedente is not None else 0.0
+    tac = taux_actuelle if taux_actuelle is not None else 0.0
+    _pdm_center_text(c, "SEMAINE PRÉCÉDENTE (S-1)", 36 + half_w / 2, box_y + taux_h - 50, "Helvetica", 9, _rl_colors.HexColor('#BBBBBB'))
+    _pdm_center_text(c, f"{ts1*100:.2f}%", 36 + half_w / 2, box_y + 22, "Helvetica-Bold", 26, WHITE)
+    _pdm_center_text(c, "CETTE SEMAINE", 36 + half_w + half_w / 2, box_y + taux_h - 50, "Helvetica", 9, _rl_colors.HexColor('#BBBBBB'))
+    delta = tac - ts1
+    worse = delta > 0
+    delta_color = RED_NEG if worse else GREEN
+    _pdm_center_text(c, f"{tac*100:.2f}%", 36 + half_w + half_w / 2, box_y + 22, "Helvetica-Bold", 26, delta_color)
+
+    c.setStrokeColor(_rl_colors.HexColor('#444444'))
+    c.setLineWidth(1)
+    c.line(36 + half_w, box_y + 14, 36 + half_w, box_y + taux_h - 40)
+
+    delta_label = f"{'+' if worse else ''}{delta*100:.2f} pt {'▲' if worse else '▼'}"
+    c.setFont("Helvetica-Bold", 10)
+    dtw = _rl_stringWidth(delta_label, "Helvetica-Bold", 10)
+    dpw = dtw + 20
+    _pdm_rounded_card(c, W / 2 - dpw / 2, box_y + taux_h - 46, dpw, 17, delta_color, radius=8)
+    c.setFillColor(WHITE)
+    c.drawCentredString(W / 2, box_y + taux_h - 46 + 4.5, delta_label)
+
+    # ---- Meilleure progression
+    positive = [p for p in ranking if p["up"]]
+    if positive:
+        best = max(positive, key=lambda p: p["evo"])
+        ribbon_y = box_y - 20 - 46
+        _pdm_rounded_card(c, 36, ribbon_y, W - 72, 46, RED, radius=10)
+        c.setFillColor(WHITE)
+        c.setFont("Helvetica-Bold", 12)
+        c.drawCentredString(W / 2, ribbon_y + 46 / 2 + 4,
+                             f"★ MEILLEURE PROGRESSION DE LA SEMAINE : {best['name']} (▲ {best['evo']:.1f}%)")
+
+    # ---- Footer
+    footer_h = 34
+    c.setFillColor(BLACK)
+    c.rect(0, 0, W, footer_h, fill=1, stroke=0)
+    c.setFillColor(RED)
+    c.rect(0, footer_h - 3, W, 3, fill=1, stroke=0)
+    today = datetime.date.today().strftime("%d/%m/%Y")
+    c.setFont("Helvetica", 9)
+    c.setFillColor(WHITE)
+    c.drawCentredString(W / 2, footer_h / 2 - 3,
+                         f"Semaine {week}  ·  Généré le {today}  ·  Merci pour votre engagement au quotidien !")
+
+    c.save()
+    return len(ranking)

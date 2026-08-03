@@ -64,6 +64,25 @@ def health():
     return {"status": "ok"}
 
 
+def _parse_historique_complet(historique_complet: Optional[str]) -> dict:
+    """Parse le parametre `historique_complet` (JSON {matricule: {semaine:
+    productivite_h}}) envoye par n8n -- construit a partir de TOUTES les
+    lignes de la Data Table productivite_employes_historique (pas juste la
+    semaine precedente comme productivite_s1). Sert a tracer la courbe
+    d'evolution multi-semaines par employe dans gen_lib.build(). Un parametre
+    absent/illisible desactive simplement la courbe, sans erreur."""
+    if not historique_complet:
+        return {}
+    try:
+        parsed = json.loads(historique_complet)
+        if not isinstance(parsed, dict):
+            return {}
+        return parsed
+    except Exception as e:
+        print(f"Avertissement: historique_complet illisible ({e}), ignore (pas de courbe d'evolution).")
+        return {}
+
+
 def _parse_productivite_s1(productivite_s1: Optional[str]) -> dict:
     productivite_s1_map = {}
     if productivite_s1:
@@ -81,13 +100,15 @@ def _parse_productivite_s1(productivite_s1: Optional[str]) -> dict:
 
 
 async def _run_build(preparation: UploadFile, planning: Optional[UploadFile],
-                      taux_actuelle, taux_precedente, semaine, productivite_s1, name_aliases=None):
+                      taux_actuelle, taux_precedente, semaine, productivite_s1, name_aliases=None,
+                      historique_complet=None):
     prep_bytes = await preparation.read()
     if not prep_bytes:
         raise HTTPException(status_code=400, detail="Fichier Preparation vide ou manquant.")
 
     productivite_s1_map = _parse_productivite_s1(productivite_s1)
     name_aliases_map = _parse_name_aliases(name_aliases)
+    historique_complet_map = _parse_historique_complet(historique_complet)
 
     work_dir = tempfile.mkdtemp(prefix="perfdrive_")
     src_path = os.path.join(work_dir, "source.xlsx")
@@ -125,6 +146,7 @@ async def _run_build(preparation: UploadFile, planning: Optional[UploadFile],
             planning_path=planning_path,
             productivite_s1=productivite_s1_map,
             name_aliases=name_aliases_map,
+            historique_complet=historique_complet_map,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur lors de la lecture du planning ou de la génération : {e}")
@@ -140,10 +162,12 @@ async def generate(
     taux_precedente: Optional[float] = Query(default=None, description="Taux de rupture de la semaine précédente (fraction)"),
     semaine: Optional[int] = Query(default=None, description="Numéro de semaine indiqué par l'expéditeur (informatif)"),
     productivite_s1: Optional[str] = Query(default=None, description="JSON {matricule: productivite_h} de la semaine précédente"),
+    historique_complet: Optional[str] = Query(default=None, description='JSON {matricule: {semaine: productivite_h}} de TOUTES les semaines passees connues, pour la courbe d\'evolution multi-semaines'),
 ):
     try:
         work_dir, out_path, out_name, week, employee_productivity = await _run_build(
             preparation, planning, taux_actuelle, taux_precedente, semaine, productivite_s1,
+            historique_complet=historique_complet,
         )
         return FileResponse(
             out_path,
@@ -229,6 +253,7 @@ async def generate_package(
     productivite_s1: Optional[str] = Query(default=None, description="JSON {matricule: productivite_h} de la semaine précédente"),
     name_aliases: Optional[str] = Query(default=None, description='JSON [[nom_preparation, nom_planning], ...] issu de la Data Table employee_name_aliases'),
     skip_ai_review: Optional[bool] = Query(default=False, description="Si vrai, saute la relecture visuelle IA (utile pour tester rapidement)"),
+    historique_complet: Optional[str] = Query(default=None, description='JSON {matricule: {semaine: productivite_h}} de TOUTES les semaines passees connues, pour la courbe d\'evolution multi-semaines'),
 ):
     """Point d'entree unique pour le pipeline "verifie avant d'envoyer" :
     genere le xlsx ET le podium PDF, les fait recontroler independamment
@@ -254,6 +279,7 @@ async def generate_package(
     try:
         work_dir, xlsx_path, xlsx_name, week, employee_productivity = await _run_build(
             preparation, planning, taux_actuelle, taux_precedente, semaine, productivite_s1, name_aliases,
+            historique_complet=historique_complet,
         )
 
         pdf_name = f"Podium Performance Drive S{week}.pdf"
@@ -326,4 +352,3 @@ async def generate_package(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur lors de la génération vérifiée : {e}")
-    

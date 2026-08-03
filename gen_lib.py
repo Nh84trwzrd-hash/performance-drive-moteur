@@ -3,6 +3,8 @@ from difflib import SequenceMatcher
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import PatternFill, Font, Alignment
 from openpyxl.chart import BarChart, LineChart, Reference
+from openpyxl.chart.axis import ChartLines
+from openpyxl.drawing.line import LineProperties
 from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.text import RichText
 from openpyxl.drawing.text import CharacterProperties, Paragraph, ParagraphProperties, RichTextProperties
@@ -802,11 +804,32 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
 
         trend_chart = LineChart()
         trend_chart.title = 'Évolution de la productivité par employé'
+        trend_chart.style = 2
+        trend_chart.width = max(26, len(sorted_weeks) * 3.4)
+        trend_chart.height = 13
+        trend_chart.gapWidth = 40
+
+        # Axe Y (productivite) : repere tous les 10, gradue depuis 0, avec
+        # quadrillage clair -- sans ca l'axe existe mais n'apporte aucun
+        # repere visuel exploitable.
         trend_chart.y_axis.title = 'Productivité /H'
+        trend_chart.y_axis.majorUnit = 10
+        trend_chart.y_axis.scaling.min = 0
+        trend_chart.y_axis.majorGridlines = ChartLines(
+            spPr=GraphicalProperties(ln=LineProperties(solidFill='D9D9D9', w=6350)))
+        trend_chart.y_axis.majorTickMark = 'out'
+        trend_chart.y_axis.tickLblPos = 'nextTo'
+        trend_chart.y_axis.delete = False
+
+        # Axe X (semaine) : une graduation par semaine, avec quadrillage
+        # vertical leger pour reperer visuellement chaque semaine.
         trend_chart.x_axis.title = 'Semaine'
-        trend_chart.style = 12
-        trend_chart.width = max(24, len(sorted_weeks) * 3)
-        trend_chart.height = 12
+        trend_chart.x_axis.majorGridlines = ChartLines(
+            spPr=GraphicalProperties(ln=LineProperties(solidFill='E8E8E8', w=6350)))
+        trend_chart.x_axis.majorTickMark = 'out'
+        trend_chart.x_axis.tickLblPos = 'nextTo'
+        trend_chart.x_axis.delete = False
+        trend_chart.x_axis.crosses = 'min'
 
         cats = Reference(ws, min_col=trend_start_col, min_row=trend_first_data_row, max_row=trend_last_data_row)
         for j, m in enumerate(sorted_matricules):
@@ -818,9 +841,16 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
         for j, m in enumerate(sorted_matricules):
             color = _stable_employee_color(m)
             series = trend_chart.series[j]
-            series.graphicalProperties.line.solidFill = color
-            series.graphicalProperties.line.width = 28575  # ~2.25pt, en EMU
             series.smooth = False
+            # Trait fin (1pt, au lieu de 2.25pt -- trop epais/grossier) pour
+            # un rendu plus soigne, avec des repere-points (marqueurs) sur
+            # chaque semaine plutot qu'une simple ligne nue.
+            series.graphicalProperties.line.solidFill = color
+            series.graphicalProperties.line.width = 12700
+            series.marker.symbol = 'circle'
+            series.marker.size = 6
+            series.marker.graphicalProperties = GraphicalProperties(
+                solidFill=color, ln=LineProperties(solidFill='FFFFFF', w=6350))
 
         # Ancre sous le tableau de donnees, alignee approximativement avec
         # le graphique en barre pour un rendu equilibre.

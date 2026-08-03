@@ -1,7 +1,8 @@
-import openpyxl, re, datetime, unicodedata, shutil, subprocess, tempfile, os
+import openpyxl, re, datetime, unicodedata, shutil, subprocess, tempfile, os, hashlib
 from difflib import SequenceMatcher
+from openpyxl.utils import get_column_letter
 from openpyxl.styles import PatternFill, Font, Alignment
-from openpyxl.chart import BarChart, Reference
+from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.text import RichText
 from openpyxl.drawing.text import CharacterProperties, Paragraph, ParagraphProperties, RichTextProperties
@@ -29,6 +30,30 @@ EXCLUDED_FROM_RANKING = {
     "MONTESCOT3",   # Adrien Navaro - responsable
     "PR0911201",    # Maelle Gendre - responsable
 }
+
+
+# Palette partagee entre le graphique en barre (classement de la semaine) et
+# la courbe d'evolution multi-semaines, pour qu'un meme employe garde
+# TOUJOURS la meme couleur d'un graphique a l'autre et d'une semaine a
+# l'autre (la position dans le classement change chaque semaine, donc une
+# couleur assignee par position ne peut pas rester stable pour la meme
+# personne -- voir _stable_employee_color).
+EMPLOYEE_COLOR_PALETTE = [
+    '4472C4', 'ED7D31', 'A5A5A5', 'FFC000', '5B9BD5', '70AD47',
+    '264478', '9E480E', '636363', '997300', '255E91', '43682B',
+    'C00000', '7030A0', '00B0F0', 'FF66CC', '00B050', 'BF8F00',
+    '203864', '833C00',
+]
+
+
+def _stable_employee_color(matricule):
+    """Couleur deterministe et stable par matricule (meme personne = meme
+    couleur, quelle que soit la semaine ou le graphique), tiree de
+    EMPLOYEE_COLOR_PALETTE via un hash du matricule -- pas de la position
+    dans un classement, qui change chaque semaine."""
+    key = matricule or ''
+    idx = int(hashlib.md5(key.encode('utf-8')).hexdigest(), 16) % len(EMPLOYEE_COLOR_PALETTE)
+    return EMPLOYEE_COLOR_PALETTE[idx]
 
 
 def get_week_and_employees(path):
@@ -393,15 +418,20 @@ def match_planning_hours(planning_hours, employee_names, threshold=_NAME_MATCH_T
 
 
 def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path=None, productivite_s1=None,
-          name_aliases=None):
+          name_aliases=None, historique_complet=None):
     """productivite_s1: dict {matricule: productivite_h_decimale} issu de la
     semaine precedente, utilise pour auto-remplir la colonne H. name_aliases:
     alias supplementaires (deja au format tuple_tokens -> tuple_tokens, voir
     parse_alias_pairs) issus d'une source persistante (Data Table n8n) plutot
-    que codes en dur, fusionnes par-dessus NAME_ALIASES. Retourne (semaine,
-    nb_employes, productivite_calculee) ou productivite_calculee est un dict
-    {matricule: productivite_h_decimale} pour cette semaine, a persister pour
-    servir de S-1 la semaine suivante."""
+    que codes en dur, fusionnes par-dessus NAME_ALIASES. historique_complet:
+    dict {matricule: {semaine: productivite_h}} couvrant TOUTES les semaines
+    passees connues (pas juste S-1) -- sert a tracer la courbe d'evolution
+    multi-semaines par employe (voir plus bas dans cette fonction) ; sans
+    cette donnee (ou avec moins de 2 semaines au total), la courbe n'est
+    simplement pas generee. Retourne (semaine, nb_employes,
+    productivite_calculee) ou productivite_calculee est un dict {matricule:
+    productivite_h_decimale} pour cette semaine, a persister pour servir de
+    S-1 (et d'historique complet) la semaine suivante."""
     week, employees = get_week_and_employees(path)
     periode_debut, periode_fin = get_periode(path)
 
@@ -456,6 +486,12 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     green_fill = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
     blue_font = Font(name=arial, color='0000FF')
 
+    # Alimente pendant la boucle ci-dessous : (matricule, productivite_h)
+    # pour chaque employe classable, utilise ensuite pour colorer le
+    # graphique en barre par IDENTITE (couleur stable) plutot que par
+    # POSITION dans le classement (qui change chaque semaine).
+    ranking_for_color = []
+
     for i, (name, prep_row, art_row, articles_count, commandes_count) in enumerate(employees):
         r = first_data_row + i
         matricule = extract_matricule(name)
@@ -483,6 +519,8 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
         # mises en cache sont correctes des l'ouverture, meme dans un lecteur
         # qui n'executerait pas le recalcul automatiquement.
         e_value = (articles_count / b_value) if (articles_count is not None and b_value) else None
+        if e_value is not None and matricule:
+            ranking_for_color.append((matricule, e_value))
         cc = ws.cell(row=r, column=3, value=f"='{prep_sheet_name}'!C{art_row}")
         cd = ws.cell(row=r, column=4, value=f"='{prep_sheet_name}'!C{prep_row}")
         ce = ws.cell(row=r, column=5, value=f"=IFERROR(C{r}/B{r},\"\")")
@@ -640,18 +678,20 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     cat_str_ref = StrRef(f=str(cats))
     chart.series[0].cat = AxDataSource(strRef=cat_str_ref)
 
-    # Une couleur distincte par employe (barre), plutot qu'une seule couleur
-    # pour toute la serie.
-    palette = [
-        '4472C4', 'ED7D31', 'A5A5A5', 'FFC000', '5B9BD5', '70AD47',
-        '264478', '9E480E', '636363', '997300', '255E91', '43682B',
-        'C00000', '7030A0', '00B0F0', 'FF66CC', '00B050', 'BF8F00',
-        '203864', '833C00',
-    ]
+    # Une couleur distincte par employe (barre), STABLE d'une semaine a
+    # l'autre : couleur assignee par IDENTITE (matricule, via
+    # _stable_employee_color) plutot que par position dans le classement de
+    # cette semaine (qui change a chaque generation) -- necessaire pour que
+    # la meme personne garde la meme couleur ici et dans la courbe
+    # d'evolution multi-semaines plus bas. ranking_for_color a ete rempli
+    # dans le meme ordre que le classement reel (trie desc. par
+    # productivite), pour matcher visuellement les barres du graphique
+    # (qui sont deja triees via LARGE/INDEX/MATCH dans les colonnes K/L/M).
+    ranking_sorted = sorted(ranking_for_color, key=lambda t: t[1], reverse=True)
     chart.series[0].graphicalProperties.varyColors = True
     data_points = []
-    for idx in range(n):
-        color = palette[idx % len(palette)]
+    for idx, (matricule_i, _) in enumerate(ranking_sorted):
+        color = _stable_employee_color(matricule_i)
         dp = DataPoint(idx=idx)
         dp.graphicalProperties = GraphicalProperties(solidFill=color)
         data_points.append(dp)
@@ -674,6 +714,118 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
 
     chart_anchor_row = last_data_row + 4
     ws.add_chart(chart, f'A{chart_anchor_row}')
+
+    # -------------------------------------------------------------------
+    # Courbe d'evolution multi-semaines (productivite/H dans le temps, une
+    # serie par employe). Ce fichier ne couvre QUE la semaine courante, donc
+    # l'historique des semaines precedentes doit etre fourni en parametre
+    # (historique_complet) -- il n'existe nulle part ailleurs dans ce
+    # classeur. Se reconstruit entierement a chaque generation avec les
+    # donnees cumulees jusqu'a la semaine courante ; sans au moins 2
+    # semaines de donnees au total, la courbe n'aurait aucun sens et n'est
+    # simplement pas generee (pas d'erreur).
+    # -------------------------------------------------------------------
+    hist_norm = {}
+    for mat, per_week in (historique_complet or {}).items():
+        if not mat or not isinstance(per_week, dict):
+            continue
+        clean = {}
+        for wk, val in per_week.items():
+            try:
+                clean[int(wk)] = float(val)
+            except (TypeError, ValueError):
+                continue
+        if clean:
+            hist_norm[mat] = clean
+
+    current_week_by_matricule = {}
+    name_by_matricule = {}
+    matricule_row_map = {}
+    for i, (nm, _, _, _, _) in enumerate(employees):
+        m = extract_matricule(nm)
+        if not m:
+            continue
+        matricule_row_map[m] = first_data_row + i
+        name_by_matricule[m] = _pdm_clean_name(nm)
+        entry = employee_productivity_this_week.get(m)
+        if entry and entry.get('productivite_h') is not None:
+            current_week_by_matricule[m] = entry['productivite_h']
+
+    all_matricules = set(hist_norm.keys()) | set(current_week_by_matricule.keys())
+    all_weeks = {week}
+    for per_week in hist_norm.values():
+        all_weeks.update(per_week.keys())
+
+    if len(all_weeks) >= 2 and all_matricules:
+        sorted_weeks = sorted(all_weeks)
+        sorted_matricules = sorted(all_matricules)
+
+        trend_start_col = 18  # colonne R, a distance des blocs O:P et K:M existants
+        trend_title_row = 1
+        trend_header_row = 2
+        trend_first_data_row = trend_header_row + 1
+        trend_last_data_row = trend_first_data_row + len(sorted_weeks) - 1
+
+        tt = ws.cell(row=trend_title_row, column=trend_start_col,
+                      value="Évolution de la productivité par employé (semaine par semaine)")
+        tt.font = Font(name=arial, bold=True, size=12)
+
+        ws.cell(row=trend_header_row, column=trend_start_col, value="Semaine").font = Font(name=arial, bold=True)
+        for j, m in enumerate(sorted_matricules):
+            c = ws.cell(row=trend_header_row, column=trend_start_col + 1 + j,
+                        value=name_by_matricule.get(m, m))
+            c.font = Font(name=arial, bold=True)
+            c.alignment = Alignment(wrap_text=True, vertical='center', horizontal='center')
+
+        for wi, wk in enumerate(sorted_weeks):
+            r = trend_first_data_row + wi
+            ws.cell(row=r, column=trend_start_col, value=wk).font = Font(name=arial)
+            for j, m in enumerate(sorted_matricules):
+                col = trend_start_col + 1 + j
+                cell = ws.cell(row=r, column=col)
+                if wk == week and m in matricule_row_map:
+                    # Semaine courante : formule live vers la colonne E de
+                    # cet employe (se recalcule si l'utilisateur modifie ses
+                    # heures dans Excel), meme principe que le reste du
+                    # classeur -- les semaines passees, elles, sont figees
+                    # (photo de l'historique au moment de cette generation).
+                    cell.value = f"=IFERROR(E{matricule_row_map[m]},\"\")"
+                else:
+                    val = hist_norm.get(m, {}).get(wk)
+                    cell.value = val if val is not None else None
+                cell.font = Font(name=arial)
+                cell.number_format = '0.00'
+
+        ws.column_dimensions[get_column_letter(trend_start_col)].width = 10
+        for j in range(len(sorted_matricules)):
+            ws.column_dimensions[get_column_letter(trend_start_col + 1 + j)].width = 15
+
+        trend_chart = LineChart()
+        trend_chart.title = 'Évolution de la productivité par employé'
+        trend_chart.y_axis.title = 'Productivité /H'
+        trend_chart.x_axis.title = 'Semaine'
+        trend_chart.style = 12
+        trend_chart.width = max(24, len(sorted_weeks) * 3)
+        trend_chart.height = 12
+
+        cats = Reference(ws, min_col=trend_start_col, min_row=trend_first_data_row, max_row=trend_last_data_row)
+        for j, m in enumerate(sorted_matricules):
+            col = trend_start_col + 1 + j
+            data = Reference(ws, min_col=col, min_row=trend_header_row, max_row=trend_last_data_row)
+            trend_chart.add_data(data, titles_from_data=True)
+        trend_chart.set_categories(cats)
+
+        for j, m in enumerate(sorted_matricules):
+            color = _stable_employee_color(m)
+            series = trend_chart.series[j]
+            series.graphicalProperties.line.solidFill = color
+            series.graphicalProperties.line.width = 28575  # ~2.25pt, en EMU
+            series.smooth = False
+
+        # Ancre sous le tableau de donnees, alignee approximativement avec
+        # le graphique en barre pour un rendu equilibre.
+        trend_chart_anchor_row = trend_last_data_row + 3
+        ws.add_chart(trend_chart, f'{get_column_letter(trend_start_col)}{trend_chart_anchor_row}')
 
     wb.calculation.fullCalcOnLoad = True
     wb.save(outpath)
@@ -1184,6 +1336,23 @@ def verify_output(prep_path, xlsx_path, planning_path=None, name_aliases=None, r
         if cell_name != name:
             errors.append(f"Ligne {r}: nom attendu '{name}', trouve '{cell_name}' (desalignement des lignes).")
             continue
+
+        # Garde-fou "division par zero anticipee" : les colonnes E/F/G/I sont
+        # deja protegees par IFERROR dans build() (elles deviennent "" au lieu
+        # d'un #DIV/0! visible si B=0), ce qui evite un formule cassee mais
+        # masque aussi silencieusement un vrai probleme de saisie -- un
+        # collaborateur avec des articles/commandes prepares mais 0h ecrite
+        # aura une productivite vide sans qu'on sache pourquoi. On le signale
+        # explicitement ici plutot que de compter sur LibreOffice (absent en
+        # production sur Render) pour le detecter apres coup.
+        b_written = ws_v.cell(row=r, column=2).value
+        if (isinstance(b_written, (int, float)) and b_written == 0
+                and ((articles_count or 0) > 0 or (commandes_count or 0) > 0)):
+            warnings.append(
+                f"{name}: heure travaillee = 0 alors que {articles_count or 0:g} article(s) et "
+                f"{commandes_count or 0:g} commande(s) sont enregistres -- la productivite restera "
+                f"vide (division evitee). Verifier si une heure a ete oubliee ou mal saisie."
+            )
 
         if planning_path:
             b_actual = ws_v.cell(row=r, column=2).value

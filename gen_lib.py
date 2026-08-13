@@ -567,6 +567,7 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
             entry = {
                 'nom': name,
                 'productivite_h': round(articles_count / b_value, 2),
+                'heures': round(b_value, 2),
             }
             if e_value is not None and h_value is not None and e_value != 0:
                 entry['evolution_pct'] = round(abs(e_value - h_value) / e_value * 100, 1)
@@ -948,9 +949,11 @@ def _pdm_clean_name(nom):
     return base.title()
 
 
-def build_ranking(employee_productivity, excluded_matricules=None):
+def build_ranking(employee_productivity, excluded_matricules=None, min_heures=15):
     """Construit la liste classee (desc. par productivite_h) a partir du dict
-    retourne par build(), en excluant les responsables."""
+    retourne par build(), en excluant les responsables et les collaborateurs
+    n'ayant pas atteint `min_heures` heures travaillees au Drive sur la
+    semaine (seuil minimum pour figurer au podium)."""
     excluded = excluded_matricules if excluded_matricules is not None else EXCLUDED_FROM_RANKING
     rows = []
     for matricule, data in (employee_productivity or {}).items():
@@ -962,6 +965,11 @@ def build_ranking(employee_productivity, excluded_matricules=None):
             # Un 0h signale presque toujours une anomalie de matricule (ex: la
             # meme personne saisie sous deux matricules differents une
             # semaine donnee) plutot qu'un veritable collaborateur a classer.
+            continue
+        heures = data.get('heures')
+        if min_heures and (heures is None or heures < min_heures):
+            # Sous le seuil minimum d'heures travaillees -- exclu du podium
+            # (mais reste dans l'historique/le fichier Excel complet).
             continue
         rows.append({
             'matricule': matricule,
@@ -976,9 +984,11 @@ def build_ranking(employee_productivity, excluded_matricules=None):
 
 def generate_podium_pdf(pdf_path, week, employee_productivity, taux_actuelle=None,
                          taux_precedente=None, enseigne="INTERMARCHÉ", magasin="MONTESCOT",
-                         excluded_matricules=None):
+                         excluded_matricules=None, min_heures=15):
     """Genere le PDF "podium" hebdomadaire (charte Intermarche) a partir des
-    resultats de build(). Retourne le nombre de collaborateurs classes."""
+    resultats de build(). Seuls les collaborateurs ayant travaille au moins
+    `min_heures` heures au Drive sur la semaine figurent au classement.
+    Retourne le nombre de collaborateurs classes."""
     if _rl_canvas is None:
         raise RuntimeError("reportlab n'est pas installe: impossible de generer le PDF podium.")
 
@@ -993,7 +1003,7 @@ def generate_podium_pdf(pdf_path, week, employee_productivity, taux_actuelle=Non
     GREY_TXT = _rl_colors.HexColor('#5B5B5B')
     GREY_PILL = _rl_colors.HexColor('#9E9E9E')
 
-    ranking = build_ranking(employee_productivity, excluded_matricules)
+    ranking = build_ranking(employee_productivity, excluded_matricules, min_heures=min_heures)
     W, H = A4
     c = _rl_canvas.Canvas(pdf_path, pagesize=A4)
 

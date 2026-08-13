@@ -419,8 +419,122 @@ def match_planning_hours(planning_hours, employee_names, threshold=_NAME_MATCH_T
     return matched
 
 
+_HHMM_RE = re.compile(r'^(\d{1,3})\s*[H:]\s*(\d{1,2})?$')
+
+
+def _parse_heures_value(v):
+    """Convertit une valeur de cellule 'Heures a deduire' en decimal
+    (heures), en acceptant plusieurs formats de saisie courants :
+    - un nombre deja decimal (2.5, ou '2,5' / '2.5' en texte) ;
+    - une duree/heure Excel native (si la cellule est formatee comme une
+      heure, openpyxl la lit comme datetime.time ou datetime.timedelta) ;
+    - un texte au format horaire 'HHhMM' ou 'HH:MM' (ex: '2h30', '2H30',
+      '2:30', ou juste '2h' pour 2h00) -- CONVERTI en decimal (2h30 -> 2.5),
+      PAS interprete comme le nombre litteral '2.30'.
+    Retourne None si la valeur ne correspond a aucun de ces formats."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, datetime.timedelta):
+        return v.total_seconds() / 3600.0
+    if isinstance(v, datetime.time):
+        return v.hour + v.minute / 60.0 + v.second / 3600.0
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        # Format horaire "2h30" / "2H30" / "2:30" / "2h" en premier -- sinon
+        # '2h30' tomberait dans le fallback decimal ci-dessous et casserait.
+        m = _HHMM_RE.match(s.upper().replace(' ', ''))
+        if m:
+            h = int(m.group(1))
+            mn = int(m.group(2)) if m.group(2) else 0
+            if mn < 60:
+                return h + mn / 60.0
+        # Sinon, nombre decimal classique (accepte la virgule francaise).
+        try:
+            return float(s.replace(',', '.'))
+        except ValueError:
+            return None
+    return None
+
+
+def parse_ajustement_xlsx(path):
+    """Lit la fiche d'ajustement optionnelle jointe a l'email : une ligne par
+    salarie dont les heures du planning doivent etre corrigees (absence non
+    planifiee, depart anticipe...). Format attendu (feuille active,
+    colonnes A/B/C) : 'Nom du salarie' | 'Heures a deduire' | 'Motif'
+    (motif lu mais non utilise dans le calcul). La colonne heures accepte un
+    decimal (4.5) OU un format horaire type '4h30'/'4H30'/'4:30' (voir
+    _parse_heures_value) -- converti en decimal, jamais interprete comme un
+    nombre litteral. Retourne (dict {nom_saisi: heures_a_deduire},
+    liste des lignes dont la valeur d'heures n'a pas pu etre comprise, sous
+    forme de tuples (nom, valeur_brute)). Aucune exception levee sur un
+    fichier mal forme -- retourne simplement ce qu'il a pu lire (au pire un
+    dict vide)."""
+    out = {}
+    unparsed = []
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True)
+        ws = wb.active
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if not row or len(row) < 2:
+                continue
+            nom, heures_raw = row[0], row[1]
+            if not nom or heures_raw is None:
+                continue
+            nom = str(nom).strip()
+            heures = _parse_heures_value(heures_raw)
+            if heures is None:
+                unparsed.append((nom, heures_raw))
+                continue
+            if heures <= 0:
+                continue
+            out[nom] = out.get(nom, 0.0) + heures
+    except Exception as e:
+        print(f"Avertissement: fiche d'ajustement illisible ({e}), ignoree.")
+        return {}, []
+    return out, unparsed
+
+
+def apply_ajustement(ajustement_raw, employees, extra_aliases=None, threshold=_NAME_MATCH_THRESHOLD):
+    """Associe chaque ligne de la fiche d'ajustement (nom saisi -> heures a
+    deduire) au nom Preparation le plus proche, avec le meme matching flou +
+    alias que pour le planning (voir match_planning_hours) -- deux lignes
+    associees au meme employe voient leurs heures cumulees. Retourne
+    (deductions, unmatched) ou deductions = {nom_preparation:
+    heures_a_deduire} et unmatched = liste des noms saisis sur la fiche qui
+    n'ont pu etre associes a aucun employe avec assez de confiance (utile
+    pour avertir plutot que d'appliquer silencieusement rien du tout)."""
+    aliases = dict(NAME_ALIASES)
+    if extra_aliases:
+        aliases.update(extra_aliases)
+    employee_names = [e[0] for e in employees]
+
+    deductions, unmatched = {}, []
+    for raw_name, heures in ajustement_raw.items():
+        raw_tokens = tuple(_normalize_name_tokens(raw_name))
+        best_score, best_emp = 0.0, None
+        for emp_name in employee_names:
+            emp_tokens = tuple(_normalize_name_tokens(emp_name))
+            if aliases.get(emp_tokens) == raw_tokens:
+                best_score, best_emp = 1.0, emp_name
+                break
+            score = _name_match_score(raw_name, emp_name)
+            if score > best_score:
+                best_score, best_emp = score, emp_name
+        if best_emp is not None and best_score >= threshold:
+            deductions[best_emp] = deductions.get(best_emp, 0.0) + heures
+        else:
+            unmatched.append(raw_name)
+    return deductions, unmatched
+
+
 def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path=None, productivite_s1=None,
-          name_aliases=None, historique_complet=None):
+          name_aliases=None, historique_complet=None, ajustement_path=None):
     """productivite_s1: dict {matricule: productivite_h_decimale} issu de la
     semaine precedente, utilise pour auto-remplir la colonne H. name_aliases:
     alias supplementaires (deja au format tuple_tokens -> tuple_tokens, voir
@@ -430,10 +544,14 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     passees connues (pas juste S-1) -- sert a tracer la courbe d'evolution
     multi-semaines par employe (voir plus bas dans cette fonction) ; sans
     cette donnee (ou avec moins de 2 semaines au total), la courbe n'est
-    simplement pas generee. Retourne (semaine, nb_employes,
-    productivite_calculee) ou productivite_calculee est un dict {matricule:
-    productivite_h_decimale} pour cette semaine, a persister pour servir de
-    S-1 (et d'historique complet) la semaine suivante."""
+    simplement pas generee. ajustement_path: fiche optionnelle jointe a
+    l'email (voir parse_ajustement_xlsx) listant des heures a deduire du
+    planning pour certains employes (absence, depart anticipe...) ; sans
+    cette donnee, les heures du planning sont utilisees telles quelles.
+    Retourne (semaine, nb_employes, productivite_calculee) ou
+    productivite_calculee est un dict {matricule: productivite_h_decimale}
+    pour cette semaine, a persister pour servir de S-1 (et d'historique
+    complet) la semaine suivante."""
     week, employees = get_week_and_employees(path)
     periode_debut, periode_fin = get_periode(path)
 
@@ -446,6 +564,12 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
         # (ex: premiere semaine d'un cycle qui demarre un mercredi).
         planning_hours = parse_planning_pdf(planning_path, date_start=periode_debut, date_end=periode_fin)
         hours_map = match_planning_hours(planning_hours, [e[0] for e in employees], extra_aliases=name_aliases)
+
+    ajustement_deductions = {}
+    if ajustement_path:
+        ajustement_raw, _unparsed = parse_ajustement_xlsx(ajustement_path)
+        if ajustement_raw:
+            ajustement_deductions, _unmatched = apply_ajustement(ajustement_raw, employees, extra_aliases=name_aliases)
 
     productivite_s1 = productivite_s1 or {}
     employee_productivity_this_week = {}
@@ -486,6 +610,7 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
 
     yellow_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
     green_fill = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
+    orange_fill = PatternFill(start_color='FFD9A0', end_color='FFD9A0', fill_type='solid')
     blue_font = Font(name=arial, color='0000FF')
 
     # Alimente pendant la boucle ci-dessous : (matricule, productivite_h)
@@ -500,11 +625,15 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
         ws.cell(row=r, column=1, value=name).font = Font(name=arial)
 
         b_value = None
+        adjusted = False
         cb = ws.cell(row=r, column=2)
         if name in hours_map:
             b_value = hours_map[name]
+            if name in ajustement_deductions and b_value is not None:
+                b_value = round(max(0.0, b_value - ajustement_deductions[name]), 2)
+                adjusted = True
             cb.value = b_value
-            cb.fill = green_fill
+            cb.fill = orange_fill if adjusted else green_fill
             cb.font = Font(name=arial)
         else:
             cb.value = None
@@ -1332,7 +1461,7 @@ def _recalc_with_libreoffice(xlsx_path, timeout=45):
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def verify_output(prep_path, xlsx_path, planning_path=None, name_aliases=None, recalc=True):
+def verify_output(prep_path, xlsx_path, planning_path=None, name_aliases=None, recalc=True, ajustement_path=None):
     """Controle qualite du fichier "Performance Drive" genere, avant envoi.
 
     Recalcule independamment les heures Drive depuis le planning et les
@@ -1358,6 +1487,34 @@ def verify_output(prep_path, xlsx_path, planning_path=None, name_aliases=None, r
     if planning_path:
         planning_hours = parse_planning_pdf(planning_path, date_start=periode_debut, date_end=periode_fin)
         hours_map = match_planning_hours(planning_hours, [e[0] for e in employees], extra_aliases=name_aliases)
+
+    # Meme correction que celle appliquee dans build() (voir la-bas) : sans
+    # ca, le controle "heures ecrites vs heures recalculees depuis le
+    # planning" ci-dessous bloquerait systematiquement des qu'une fiche
+    # d'ajustement est jointe, puisque le fichier genere contient les heures
+    # APRES deduction alors que hours_map ci-dessus contient les heures BRUTES
+    # du planning.
+    ajustement_deductions, ajustement_unmatched = {}, []
+    if ajustement_path:
+        ajustement_raw, ajustement_unparsed = parse_ajustement_xlsx(ajustement_path)
+        if ajustement_raw:
+            ajustement_deductions, ajustement_unmatched = apply_ajustement(
+                ajustement_raw, employees, extra_aliases=name_aliases)
+        for raw_name, raw_value in ajustement_unparsed:
+            warnings.append(
+                f"Fiche d'ajustement : la valeur '{raw_value}' (heures a deduire pour '{raw_name}') n'a pas "
+                f"pu etre comprise (formats acceptes : decimal comme 4.5, ou horaire comme 4h30) -- cette "
+                f"deduction n'a PAS ete appliquee."
+            )
+        for raw_name in ajustement_unmatched:
+            warnings.append(
+                f"Fiche d'ajustement : le nom '{raw_name}' n'a pu etre associe a aucun employe de la "
+                f"Preparation (orthographe differente ?) -- cette deduction n'a PAS ete appliquee."
+            )
+        for emp_name, heures_deduites in ajustement_deductions.items():
+            warnings.append(
+                f"{emp_name}: {heures_deduites:g}h deduites du planning via la fiche d'ajustement jointe."
+            )
 
     prod_sheet_name = f'Feuil2 Productivité Semaine {week}'
 
@@ -1397,6 +1554,8 @@ def verify_output(prep_path, xlsx_path, planning_path=None, name_aliases=None, r
         if planning_path:
             b_actual = ws_v.cell(row=r, column=2).value
             b_expected = hours_map.get(name)
+            if b_expected is not None and name in ajustement_deductions:
+                b_expected = round(max(0.0, b_expected - ajustement_deductions[name]), 2)
             if b_expected is not None:
                 if b_actual is None or abs(float(b_actual) - float(b_expected)) > 0.01:
                     errors.append(

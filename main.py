@@ -101,7 +101,7 @@ def _parse_productivite_s1(productivite_s1: Optional[str]) -> dict:
 
 async def _run_build(preparation: UploadFile, planning: Optional[UploadFile],
                       taux_actuelle, taux_precedente, semaine, productivite_s1, name_aliases=None,
-                      historique_complet=None):
+                      historique_complet=None, ajustement: Optional[UploadFile] = None):
     prep_bytes = await preparation.read()
     if not prep_bytes:
         raise HTTPException(status_code=400, detail="Fichier Preparation vide ou manquant.")
@@ -122,6 +122,18 @@ async def _run_build(preparation: UploadFile, planning: Optional[UploadFile],
             planning_path = os.path.join(work_dir, "planning.pdf")
             with open(planning_path, "wb") as f:
                 f.write(planning_bytes)
+
+    # Fiche d'ajustement : vraiment optionnelle (n8n envoie systematiquement
+    # un fichier "ajustement" mais un placeholder vide quand rien n'est
+    # joint a l'email -- on l'ignore simplement dans ce cas, comme pour un
+    # planning absent).
+    ajustement_path = None
+    if ajustement is not None:
+        ajustement_bytes = await ajustement.read()
+        if ajustement_bytes:
+            ajustement_path = os.path.join(work_dir, "ajustement.xlsx")
+            with open(ajustement_path, "wb") as f:
+                f.write(ajustement_bytes)
 
     try:
         detected_week, employees = gen_lib.get_week_and_employees(src_path)
@@ -147,6 +159,7 @@ async def _run_build(preparation: UploadFile, planning: Optional[UploadFile],
             productivite_s1=productivite_s1_map,
             name_aliases=name_aliases_map,
             historique_complet=historique_complet_map,
+            ajustement_path=ajustement_path,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur lors de la lecture du planning ou de la génération : {e}")
@@ -247,6 +260,7 @@ async def podium(
 async def generate_package(
     preparation: UploadFile = File(..., description="Fichier Preparation .xlsx"),
     planning: Optional[UploadFile] = File(default=None, description="Planning PDF hebdomadaire (optionnel)"),
+    ajustement: Optional[UploadFile] = File(default=None, description="Fiche d'ajustement des heures (optionnelle) : colonnes Nom du salarie / Heures a deduire / Motif"),
     taux_actuelle: Optional[float] = Query(default=None, description="Taux de rupture de la semaine courante (fraction)"),
     taux_precedente: Optional[float] = Query(default=None, description="Taux de rupture de la semaine précédente (fraction)"),
     semaine: Optional[int] = Query(default=None),
@@ -281,7 +295,7 @@ async def generate_package(
     try:
         work_dir, xlsx_path, xlsx_name, week, employee_productivity = await _run_build(
             preparation, planning, taux_actuelle, taux_precedente, semaine, productivite_s1, name_aliases,
-            historique_complet=historique_complet,
+            historique_complet=historique_complet, ajustement=ajustement,
         )
 
         pdf_name = f"Podium Performance Drive S{week}.pdf"
@@ -309,11 +323,13 @@ async def generate_package(
         prep_path = os.path.join(work_dir, "source.xlsx")
         planning_path = os.path.join(work_dir, "planning.pdf")
         planning_path = planning_path if os.path.exists(planning_path) else None
+        ajustement_path = os.path.join(work_dir, "ajustement.xlsx")
+        ajustement_path = ajustement_path if os.path.exists(ajustement_path) else None
         name_aliases_map = _parse_name_aliases(name_aliases)
 
         xlsx_report = gen_lib.verify_output(
             prep_path, xlsx_path, planning_path=planning_path,
-            name_aliases=name_aliases_map, recalc=True,
+            name_aliases=name_aliases_map, recalc=True, ajustement_path=ajustement_path,
         )
         errors.extend(xlsx_report["errors"])
         warnings.extend(xlsx_report["warnings"])

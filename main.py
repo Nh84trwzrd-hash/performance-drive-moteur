@@ -254,6 +254,8 @@ async def generate_package(
     name_aliases: Optional[str] = Query(default=None, description='JSON [[nom_preparation, nom_planning], ...] issu de la Data Table employee_name_aliases'),
     skip_ai_review: Optional[bool] = Query(default=False, description="Si vrai, saute la relecture visuelle IA (utile pour tester rapidement)"),
     historique_complet: Optional[str] = Query(default=None, description='JSON {matricule: {semaine: productivite_h}} de TOUTES les semaines passees connues, pour la courbe d\'evolution multi-semaines'),
+    magasin: Optional[str] = Query(default="MONTESCOT", description="Nom du magasin affiche sur le PDF podium (ex: MONTESCOT, CANOHES)"),
+    enseigne: Optional[str] = Query(default="INTERMARCHÉ", description="Nom de l'enseigne affichee sur le PDF podium"),
 ):
     """Point d'entree unique pour le pipeline "verifie avant d'envoyer" :
     genere le xlsx ET le podium PDF, les fait recontroler independamment
@@ -289,6 +291,7 @@ async def generate_package(
             gen_lib.generate_podium_pdf(
                 pdf_path, week, employee_productivity,
                 taux_actuelle=taux_actuelle, taux_precedente=taux_precedente,
+                enseigne=enseigne, magasin=magasin,
             )
         except Exception as e:
             # Le generateur leve volontairement une erreur explicite si la

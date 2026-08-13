@@ -83,6 +83,27 @@ def _parse_historique_complet(historique_complet: Optional[str]) -> dict:
         return {}
 
 
+def _parse_optional_float(value: Optional[str]) -> Optional[float]:
+    """Parse un parametre Query potentiellement vide. n8n envoie parfois une
+    chaine vide plutot que d'omettre carrement le parametre quand une
+    expression comme {{ $json.tauxPrecedente }} vaut null (ex: tout premier
+    envoi d'un magasin, sans taux de rupture S-1 connu -- vu en prod sur le
+    lancement de Canohes) : FastAPI rejette normalement '' comme un float
+    invalide (422 avant meme d'entrer dans le code). Traite '' / None / un
+    texte illisible comme simplement absent, plutot que de faire echouer
+    toute la generation pour une info non bloquante."""
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        print(f"Avertissement: valeur de taux illisible ('{value}'), ignoree.")
+        return None
+
+
 def _parse_productivite_s1(productivite_s1: Optional[str]) -> dict:
     productivite_s1_map = {}
     if productivite_s1:
@@ -106,6 +127,8 @@ async def _run_build(preparation: UploadFile, planning: Optional[UploadFile],
     if not prep_bytes:
         raise HTTPException(status_code=400, detail="Fichier Preparation vide ou manquant.")
 
+    taux_actuelle = _parse_optional_float(taux_actuelle)
+    taux_precedente = _parse_optional_float(taux_precedente)
     productivite_s1_map = _parse_productivite_s1(productivite_s1)
     name_aliases_map = _parse_name_aliases(name_aliases)
     historique_complet_map = _parse_historique_complet(historique_complet)
@@ -164,21 +187,21 @@ async def _run_build(preparation: UploadFile, planning: Optional[UploadFile],
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur lors de la lecture du planning ou de la génération : {e}")
 
-    return work_dir, out_path, out_name, week, employee_productivity
+    return work_dir, out_path, out_name, week, employee_productivity, taux_actuelle, taux_precedente
 
 
 @app.post("/generate")
 async def generate(
     preparation: UploadFile = File(..., description="Fichier Preparation .xlsx"),
     planning: Optional[UploadFile] = File(default=None, description="Planning PDF hebdomadaire (optionnel)"),
-    taux_actuelle: Optional[float] = Query(default=None, description="Taux de rupture de la semaine courante (fraction, ex: 0.0245 pour 2.45%)"),
-    taux_precedente: Optional[float] = Query(default=None, description="Taux de rupture de la semaine précédente (fraction)"),
+    taux_actuelle: Optional[str] = Query(default=None, description="Taux de rupture de la semaine courante (fraction, ex: 0.0245 pour 2.45%). Chaine vide toleree (traitee comme absente)."),
+    taux_precedente: Optional[str] = Query(default=None, description="Taux de rupture de la semaine précédente (fraction). Chaine vide toleree (traitee comme absente)."),
     semaine: Optional[int] = Query(default=None, description="Numéro de semaine indiqué par l'expéditeur (informatif)"),
     productivite_s1: Optional[str] = Query(default=None, description="JSON {matricule: productivite_h} de la semaine précédente"),
     historique_complet: Optional[str] = Query(default=None, description='JSON {matricule: {semaine: productivite_h}} de TOUTES les semaines passees connues, pour la courbe d\'evolution multi-semaines'),
 ):
     try:
-        work_dir, out_path, out_name, week, employee_productivity = await _run_build(
+        work_dir, out_path, out_name, week, employee_productivity, _ta, _tp = await _run_build(
             preparation, planning, taux_actuelle, taux_precedente, semaine, productivite_s1,
             historique_complet=historique_complet,
         )
@@ -200,8 +223,8 @@ async def generate(
 async def productivity(
     preparation: UploadFile = File(..., description="Fichier Preparation .xlsx"),
     planning: Optional[UploadFile] = File(default=None, description="Planning PDF hebdomadaire (optionnel)"),
-    taux_actuelle: Optional[float] = Query(default=None),
-    taux_precedente: Optional[float] = Query(default=None),
+    taux_actuelle: Optional[str] = Query(default=None),
+    taux_precedente: Optional[str] = Query(default=None),
     semaine: Optional[int] = Query(default=None),
     productivite_s1: Optional[str] = Query(default=None),
 ):
@@ -209,7 +232,7 @@ async def productivity(
     detectee + productivite par employe), sans le fichier. Appele par n8n en
     parallele de /generate pour alimenter l'historique par employe."""
     try:
-        _work_dir, _out_path, _out_name, week, employee_productivity = await _run_build(
+        _work_dir, _out_path, _out_name, week, employee_productivity, _ta, _tp = await _run_build(
             preparation, planning, taux_actuelle, taux_precedente, semaine, productivite_s1,
         )
         return JSONResponse({
@@ -226,8 +249,8 @@ async def productivity(
 async def podium(
     preparation: UploadFile = File(..., description="Fichier Preparation .xlsx"),
     planning: Optional[UploadFile] = File(default=None, description="Planning PDF hebdomadaire (optionnel)"),
-    taux_actuelle: Optional[float] = Query(default=None, description="Taux de rupture de la semaine courante (fraction)"),
-    taux_precedente: Optional[float] = Query(default=None, description="Taux de rupture de la semaine précédente (fraction)"),
+    taux_actuelle: Optional[str] = Query(default=None, description="Taux de rupture de la semaine courante (fraction)"),
+    taux_precedente: Optional[str] = Query(default=None, description="Taux de rupture de la semaine précédente (fraction)"),
     semaine: Optional[int] = Query(default=None),
     productivite_s1: Optional[str] = Query(default=None),
 ):
@@ -235,14 +258,14 @@ async def podium(
     (classement + rappel taux de rupture, charte Intermarché) destine a etre
     affiche en salle de pause. Appele par n8n en parallele de /generate."""
     try:
-        work_dir, _out_path, _out_name, week, employee_productivity = await _run_build(
+        work_dir, _out_path, _out_name, week, employee_productivity, taux_actuelle_f, taux_precedente_f = await _run_build(
             preparation, planning, taux_actuelle, taux_precedente, semaine, productivite_s1,
         )
         pdf_name = f"Podium Performance Drive S{week}.pdf"
         pdf_path = os.path.join(work_dir, pdf_name)
         gen_lib.generate_podium_pdf(
             pdf_path, week, employee_productivity,
-            taux_actuelle=taux_actuelle, taux_precedente=taux_precedente,
+            taux_actuelle=taux_actuelle_f, taux_precedente=taux_precedente_f,
         )
         return FileResponse(
             pdf_path,
@@ -261,8 +284,8 @@ async def generate_package(
     preparation: UploadFile = File(..., description="Fichier Preparation .xlsx"),
     planning: Optional[UploadFile] = File(default=None, description="Planning PDF hebdomadaire (optionnel)"),
     ajustement: Optional[UploadFile] = File(default=None, description="Fiche d'ajustement des heures (optionnelle) : colonnes Nom du salarie / Heures a deduire / Motif"),
-    taux_actuelle: Optional[float] = Query(default=None, description="Taux de rupture de la semaine courante (fraction)"),
-    taux_precedente: Optional[float] = Query(default=None, description="Taux de rupture de la semaine précédente (fraction)"),
+    taux_actuelle: Optional[str] = Query(default=None, description="Taux de rupture de la semaine courante (fraction). Chaine vide toleree (traitee comme absente)."),
+    taux_precedente: Optional[str] = Query(default=None, description="Taux de rupture de la semaine précédente (fraction). Chaine vide toleree (traitee comme absente)."),
     semaine: Optional[int] = Query(default=None),
     productivite_s1: Optional[str] = Query(default=None, description="JSON {matricule: productivite_h} de la semaine précédente"),
     name_aliases: Optional[str] = Query(default=None, description='JSON [[nom_preparation, nom_planning], ...] issu de la Data Table employee_name_aliases'),
@@ -293,7 +316,7 @@ async def generate_package(
     positif de l'IA bloque la cadence hebdomadaire a lui seul.
     """
     try:
-        work_dir, xlsx_path, xlsx_name, week, employee_productivity = await _run_build(
+        work_dir, xlsx_path, xlsx_name, week, employee_productivity, taux_actuelle, taux_precedente = await _run_build(
             preparation, planning, taux_actuelle, taux_precedente, semaine, productivite_s1, name_aliases,
             historique_complet=historique_complet, ajustement=ajustement,
         )

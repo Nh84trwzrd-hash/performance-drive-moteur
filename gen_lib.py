@@ -109,12 +109,14 @@ def get_periode(path):
 # ---------------------------------------------------------------------------
 
 _NAME_RE = re.compile(r'^[A-ZÀ-Ÿ\-]+$')
-# Certains intitules de rayon contiennent un "/" (ex: "ECOLE/FORMATION") : une
-# regex n'autorisant pas ce caractere fait echouer la reconnaissance de toute
-# la ligne de tags rayon pour l'employe concerne, et ses heures DRIVE reelles
-# sont alors silencieusement comptees comme 0 (aucun tag ne peut alors
-# correspondre a "DRIVE" puisque la ligne entiere est rejetee).
-_TAG_RE = re.compile(r'^[A-ZÀ-Ÿ\-/]+$')
+# Certains intitules de rayon contiennent un "/" (ex: "ECOLE/FORMATION") ou
+# sont combines avec un ";" quand un employe partage un creneau entre deux
+# rayons (ex: "DRIVE;ECOLE/F") : une regex n'autorisant pas ces caracteres
+# fait echouer la reconnaissance de toute la ligne de tags rayon pour
+# l'employe concerne, et ses heures DRIVE reelles sont alors silencieusement
+# comptees comme 0 (aucun tag ne peut alors correspondre a "DRIVE" puisque la
+# ligne entiere est rejetee).
+_TAG_RE = re.compile(r'^[A-ZÀ-Ÿ\-/;]+$')
 _HOUR_RE = re.compile(r'^\d{1,2}h\d{2}$')
 _REPOS_TOKENS = {"REPOS", "MALADIE", "ACCIDENT", "CP"}
 _NOISE_TOKENS = {
@@ -122,6 +124,15 @@ _NOISE_TOKENS = {
     "indiqués", "ci-dessus", "pris", "pauses", "indiquées", "sur", "chaque", "semaine",
     ":", "TOTAL", "Nb", "Heure",
 }
+# Annotation parasite "(X.XX heures de Solidarité)" que certains plannings
+# placent juste sous le total hebdo (employes a 36h45 avec des heures de
+# solidarite) : verticalement assez proche de la ligne des tags de rayon pour
+# atterrir dans le meme cluster de ligne (voir _cluster_rows). Sans filtrage,
+# la simple presence de ces tokens dans la ligne suffit a faire echouer la
+# reconnaissance de TOUTE la ligne de tags -- observe en prod sur le planning
+# S33 Montescot (quasi tous les employes Drive a 36h45 tombaient a 0h alors
+# que des articles/commandes etaient bien enregistres pour eux).
+_HOURS_NOTE_NOISE_RE = re.compile(r'^\(?\d+([.,]\d+)?\)?$|^heures$|^de$|^Solidarit[ée]\)?$', re.IGNORECASE)
 
 
 def _cluster_rows(words, tol=2.5):
@@ -287,8 +298,16 @@ def parse_planning_pdf(pdf_path, department='DRIVE', date_start=None, date_end=N
                         hours_row = r
                     elif toks and all(t in _REPOS_TOKENS for t in toks):
                         pass
-                    elif toks and all(_TAG_RE.match(t) for t in toks) and r[0]['x0'] >= 135:
-                        tags_row = r
+                    elif toks and r[0]['x0'] >= 135:
+                        # Ne pas exiger que TOUS les tokens de la ligne soient
+                        # des tags valides : l'annotation "(X.XX heures de
+                        # Solidarite)" peut partager la meme ligne que les
+                        # tags de rayon (voir _HOURS_NOTE_NOISE_RE) sans que
+                        # ca invalide les vrais tags qui s'y trouvent aussi.
+                        real_tags = [w for w in r if _TAG_RE.match(w['text'])]
+                        leftover = [w for w in r if not _TAG_RE.match(w['text'])]
+                        if real_tags and all(_HOURS_NOTE_NOISE_RE.match(w['text']) for w in leftover):
+                            tags_row = real_tags
 
                 if not hours_row:
                     result[name] = 0.0
@@ -300,7 +319,12 @@ def parse_planning_pdf(pdf_path, department='DRIVE', date_start=None, date_end=N
                 dept_hours = 0.0
                 for i, htok in enumerate(hour_tokens):
                     tag = groups[i]['text'].strip().upper() if i < len(groups) else None
-                    if tag != department.upper():
+                    # Un creneau peut etre partage entre plusieurs rayons,
+                    # affiche combine avec un ";" (ex: "DRIVE;ECOLE/F") : on
+                    # compte le creneau des que `department` figure parmi les
+                    # rayons listes, pas seulement en cas d'egalite exacte.
+                    tag_parts = tag.split(';') if tag else []
+                    if department.upper() not in tag_parts:
                         continue
                     if day_columns:
                         d = _date_for_x(htok['x0'], day_columns)

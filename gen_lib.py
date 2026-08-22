@@ -33,6 +33,13 @@ EXCLUDED_FROM_RANKING = {
     "PR0911201",    # Maelle Gendre - responsable
 }
 
+# Matricules exclus ENTIEREMENT de la generation (aucune ligne dans le
+# fichier Excel, absent du classement/graphique/PDF podium) -- pas juste du
+# classement comme EXCLUDED_FROM_RANKING ci-dessus. A adapter si necessaire.
+EXCLUDED_FROM_GENERATION = {
+    "PR1311201",    # "XX XX" - nom generique/placeholder, pas un vrai preparateur
+}
+
 
 # Palette partagee entre le graphique en barre (classement de la semaine) et
 # la courbe d'evolution multi-semaines, pour qu'un meme employe garde
@@ -75,15 +82,28 @@ def get_week_and_employees(path):
             return None
 
     row = 25
-    employees = []  # (name, prep_row, articles_row, articles_count, commandes_count)
+    employees = []  # (name, prep_row, articles_row, articles_count, commandes_count, manquants_count, taux_avant, taux_apres)
     while row <= ws.max_row:
         name = ws.cell(row=row, column=2).value
         if isinstance(name, str) and '(' in name and ')' in name:
             prep_row = row + 1
             articles_row = row + 3
+            taux_avant_row = row + 4  # "Tx. de rupture avant substitution (réf)"
+            taux_apres_row = row + 5  # "Tx. de rupture après substitution (réf)"
+            manquants_row = row + 7  # "Nb d'articles mis en manquant et en stock"
             articles_count = _to_float(ws.cell(row=articles_row, column=3).value)
             commandes_count = _to_float(ws.cell(row=prep_row, column=3).value)
-            employees.append((name.strip(), prep_row, articles_row, articles_count, commandes_count))
+            manquants_count = _to_float(ws.cell(row=manquants_row, column=3).value)
+            taux_avant = _to_float(ws.cell(row=taux_avant_row, column=3).value)
+            taux_apres = _to_float(ws.cell(row=taux_apres_row, column=3).value)
+            # Collaborateur ignore si son nombre d'articles scannes (prepares)
+            # vaut exactement 0 -- absent du fichier Excel genere (aucune
+            # ligne, ni dans le classement/graphique/PDF podium). None (case
+            # non renseignee) n'est PAS traite comme 0 : seule une valeur
+            # explicitement nulle exclut le collaborateur.
+            if articles_count != 0:
+                employees.append((name.strip(), prep_row, articles_row, articles_count, commandes_count,
+                                   manquants_count, taux_avant, taux_apres))
             row += 12
         else:
             row += 1
@@ -558,8 +578,18 @@ def apply_ajustement(ajustement_raw, employees, extra_aliases=None, threshold=_N
 
 
 def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path=None, productivite_s1=None,
-          name_aliases=None, historique_complet=None, ajustement_path=None):
-    """productivite_s1: dict {matricule: productivite_h_decimale} issu de la
+          name_aliases=None, historique_complet=None, ajustement_path=None,
+          hours_override=None):
+    """hours_override: dict {nom_preparation: heures_decimales} qui, si
+    fourni, REMPLACE entierement le matching planning -- utilise pour
+    regenerer un document historique dont on n'a plus le planning PDF
+    d'origine (ex: correction retroactive), a partir des heures DEJA
+    validees d'un ancien document genere (colonne B de Feuil2). Quand
+    hours_override est fourni, planning_path est ignore (aucun recoupement
+    n'est refait) et les heures sont considerees FINALES : aucune deduction
+    de fiche d'ajustement n'est reappliquee par-dessus (ajustement_path doit
+    rester absent dans ce cas, sinon les heures seraient deduites deux fois).
+    productivite_s1: dict {matricule: productivite_h_decimale} issu de la
     semaine precedente, utilise pour auto-remplir la colonne H. name_aliases:
     alias supplementaires (deja au format tuple_tokens -> tuple_tokens, voir
     parse_alias_pairs) issus d'une source persistante (Data Table n8n) plutot
@@ -574,13 +604,19 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     cette donnee, les heures du planning sont utilisees telles quelles.
     Retourne (semaine, nb_employes, productivite_calculee) ou
     productivite_calculee est un dict {matricule: productivite_h_decimale}
-    pour cette semaine, a persister pour servir de S-1 (et d'historique
-    complet) la semaine suivante."""
+    pour cette semaine. Chaque entree contient egalement, quand disponibles
+    dans le fichier Preparation, trois valeurs affichees telles quelles (pas
+    recalculees) sur le fichier Excel et le PDF podium : 'manquants' (nombre
+    brut d'articles mis en manquant et en stock), 'taux_avant' (taux de
+    rupture avant substitution) et 'taux_apres' (taux de rupture apres
+    substitution)."""
     week, employees = get_week_and_employees(path)
     periode_debut, periode_fin = get_periode(path)
 
     hours_map = {}
-    if planning_path:
+    if hours_override:
+        hours_map = dict(hours_override)
+    elif planning_path:
         # Ne compter que les heures DRIVE dont la date tombe dans la periode
         # reellement couverte par le fichier Preparation : le planning peut
         # afficher une semaine calendaire complete (Lundi-Dimanche) alors que
@@ -624,9 +660,14 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     ws['A1'] = 'Tableau 2 - Productivité'
     ws['A1'].font = Font(name=arial, bold=True, size=14)
 
+    # Les 3 indicateurs de rupture (manquants brut, taux avant/apres
+    # substitution) sont integres directement dans ce premier tableau, juste
+    # apres "Productivité /H" (colonnes F/G/H) -- plus de bloc separe plus a
+    # droite. "Productivité minutes" a ete retiree (non demandee).
     headers = ['Employé', 'Heure travaillée', "Nbr d'articles préparés",
-               'Nbr de commande préparés', 'Productivité /H', 'Productivité minutes',
-               'Nombre de commande à l\'heure']
+               'Nbr de commande préparés', 'Productivité /H',
+               'Nb articles manquants et en stock', 'Taux de rupture avant substitution',
+               'Taux de rupture après substitution', 'Nombre de commande à l\'heure']
     for i, h in enumerate(headers):
         c = ws.cell(row=2, column=1+i, value=h)
         c.font = Font(name=arial, bold=True)
@@ -643,7 +684,8 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     # POSITION dans le classement (qui change chaque semaine).
     ranking_for_color = []
 
-    for i, (name, prep_row, art_row, articles_count, commandes_count) in enumerate(employees):
+    for i, (name, prep_row, art_row, articles_count, commandes_count, manquants_count,
+            taux_avant, taux_apres) in enumerate(employees):
         r = first_data_row + i
         matricule = extract_matricule(name)
         ws.cell(row=r, column=1, value=name).font = Font(name=arial)
@@ -665,127 +707,170 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
             cb.font = blue_font
         cb.number_format = '0.00'
 
-        # C/D/E/F/G : toujours des formules Excel live (references a la feuille
-        # Preparation et a la colonne B), meme quand B est deja auto-rempli
-        # depuis le planning. Ainsi, si l'utilisateur modifie une heure (ou
-        # tout autre nombre) dans Excel, la productivite et le graphique se
-        # recalculent automatiquement. Le fichier livre est tout de meme
-        # recalcule cote serveur (LibreOffice) avant envoi, donc les valeurs
-        # mises en cache sont correctes des l'ouverture, meme dans un lecteur
-        # qui n'executerait pas le recalcul automatiquement.
+        # C/D/E/F/G/H/I : toujours des formules Excel live (references a la
+        # feuille Preparation et a la colonne B), meme quand B est deja
+        # auto-rempli depuis le planning. Ainsi, si l'utilisateur modifie une
+        # heure (ou tout autre nombre) dans Excel, la productivite et le
+        # graphique se recalculent automatiquement. Le fichier livre est tout
+        # de meme recalcule cote serveur (LibreOffice) avant envoi, donc les
+        # valeurs mises en cache sont correctes des l'ouverture, meme dans un
+        # lecteur qui n'executerait pas le recalcul automatiquement.
         e_value = (articles_count / b_value) if (articles_count is not None and b_value) else None
         if e_value is not None and matricule:
             ranking_for_color.append((matricule, e_value))
         cc = ws.cell(row=r, column=3, value=f"='{prep_sheet_name}'!C{art_row}")
         cd = ws.cell(row=r, column=4, value=f"='{prep_sheet_name}'!C{prep_row}")
         ce = ws.cell(row=r, column=5, value=f"=IFERROR(C{r}/B{r},\"\")")
-        cf = ws.cell(row=r, column=6, value=f"=IFERROR(E{r}/60,\"\")")
-        cg = ws.cell(row=r, column=7, value=f"=IFERROR(D{r}/B{r},\"\")")
         cc.font = Font(name=arial, color='008000')
         cd.font = Font(name=arial, color='008000')
         ce.font = Font(name=arial)
         ce.number_format = '0.00'
-        cf.font = Font(name=arial)
-        cf.number_format = '0.00'
-        cg.font = Font(name=arial)
-        cg.number_format = '0.00'
+
+        # F/G/H : indicateurs rupture, references directes a la feuille
+        # Preparation (pas de calcul ni de comparaison S-1) -- affiches tels
+        # quels, exactement comme saisis/calcules dans le fichier d'origine.
+        manquants_row = art_row + 4   # "Nb d'articles mis en manquant et en stock"
+        taux_avant_row = art_row + 1  # "Tx. de rupture avant substitution (réf)"
+        taux_apres_row = art_row + 2  # "Tx. de rupture après substitution (réf)"
+        cf = ws.cell(row=r, column=6, value=f"='{prep_sheet_name}'!C{manquants_row}")
+        cf.font = Font(name=arial, color='008000')
+        cf.number_format = '0'
+        cg = ws.cell(row=r, column=7, value=f"='{prep_sheet_name}'!C{taux_avant_row}")
+        cg.font = Font(name=arial, color='008000')
+        cg.number_format = '0.0%'
+        ch_apres = ws.cell(row=r, column=8, value=f"='{prep_sheet_name}'!C{taux_apres_row}")
+        ch_apres.font = Font(name=arial, color='008000')
+        ch_apres.number_format = '0.0%'
+
+        # I : "Nombre de commande à l'heure" (D/B).
+        ci_cmd = ws.cell(row=r, column=9, value=f"=IFERROR(D{r}/B{r},\"\")")
+        ci_cmd.font = Font(name=arial)
+        ci_cmd.number_format = '0.00'
 
         h_value = None
-        ch = ws.cell(row=r, column=8)
+        cj = ws.cell(row=r, column=10)
         if matricule and matricule in productivite_s1:
             h_value = productivite_s1[matricule]
-            ch.value = h_value
-            ch.fill = green_fill
-            ch.font = Font(name=arial)
+            cj.value = h_value
+            cj.fill = green_fill
+            cj.font = Font(name=arial)
         else:
-            ch.value = None
-            ch.fill = yellow_fill
-            ch.font = blue_font
-        ch.number_format = '0.00'
+            cj.value = None
+            cj.fill = yellow_fill
+            cj.font = blue_font
+        cj.number_format = '0.00'
 
         # % Evolution vs S-1 : difference entre Productivite/H (E, semaine
-        # actuelle) et Productivite/H S-1 (H), exprimee en % de la valeur
-        # ACTUELLE (E) — donc (E-H)/E*100, pas /H. Toujours une formule live
-        # (meme raison que C-G ci-dessus : rester dynamique si l'utilisateur
+        # actuelle) et Productivite/H S-1 (J), exprimee en % de la valeur
+        # ACTUELLE (E) — donc (E-J)/E*100, pas /J. Toujours une formule live
+        # (meme raison que C-I ci-dessus : rester dynamique si l'utilisateur
         # modifie les heures ou la productivite S-1 dans Excel).
-        ci = ws.cell(row=r, column=9,
-                      value=(f"=IFERROR(IF(OR(E{r}=\"\",H{r}=\"\"),\"\",IF(E{r}>=H{r},\"▲ \",\"▼ \")"
-                             f"&ROUND(ABS(E{r}-H{r})/E{r}*100,1)&\"%\"),\"\")"))
-        ci.font = Font(name=arial, bold=True)
-        ci.alignment = Alignment(horizontal='center')
+        ck_evo = ws.cell(row=r, column=11,
+                          value=(f"=IFERROR(IF(OR(E{r}=\"\",J{r}=\"\"),\"\",IF(E{r}>=J{r},\"▲ \",\"▼ \")"
+                                 f"&ROUND(ABS(E{r}-J{r})/E{r}*100,1)&\"%\"),\"\")"))
+        ck_evo.font = Font(name=arial, bold=True)
+        ck_evo.alignment = Alignment(horizontal='center')
 
-        # Productivite calculee cette semaine (pour servir de S-1 la semaine prochaine)
-        # -- calcul Python interne uniquement, n'affecte pas les cellules ecrites.
-        if matricule and b_value and articles_count is not None:
-            entry = {
-                'nom': name,
-                'productivite_h': round(articles_count / b_value, 2),
-                'heures': round(b_value, 2),
-            }
-            if e_value is not None and h_value is not None and e_value != 0:
-                entry['evolution_pct'] = round(abs(e_value - h_value) / e_value * 100, 1)
-                entry['evolution_up'] = e_value >= h_value
+        # Valeurs calculees cette semaine (pour le PDF podium) -- calcul
+        # Python interne uniquement, n'affecte pas les cellules ecrites.
+        if matricule:
+            # Ces trois valeurs ne dependent QUE du fichier Preparation (pas
+            # des heures travaillees) : contrairement a 'productivite_h',
+            # elles doivent rester disponibles meme quand le planning est
+            # absent/non recoupe (b_value manquant).
+            entry = employee_productivity_this_week.get(matricule, {'nom': name})
+            if manquants_count is not None:
+                entry['manquants'] = round(manquants_count, 2)
+            if articles_count is not None:
+                entry['articles_scannes'] = round(articles_count, 2)
+            if taux_avant is not None:
+                entry['taux_avant'] = round(taux_avant, 4)
+            if taux_apres is not None:
+                entry['taux_apres'] = round(taux_apres, 4)
+            if b_value and articles_count is not None:
+                entry['productivite_h'] = round(articles_count / b_value, 2)
+                entry['heures'] = round(b_value, 2)
+                if e_value is not None and h_value is not None and e_value != 0:
+                    entry['evolution_pct'] = round(abs(e_value - h_value) / e_value * 100, 1)
+                    entry['evolution_up'] = e_value >= h_value
             employee_productivity_this_week[matricule] = entry
 
     headers2 = ['Productivité /H S-1', '% Évolution vs S-1']
     for i, h in enumerate(headers2):
-        c = ws.cell(row=2, column=8+i, value=h)
+        c = ws.cell(row=2, column=10+i, value=h)
         c.font = Font(name=arial, bold=True)
         c.alignment = Alignment(wrap_text=True, vertical='center', horizontal='center')
 
     ws.conditional_formatting.add(
-        f'I{first_data_row}:I{last_data_row}',
-        FormulaRule(formula=[f'AND($E{first_data_row}<>\"\",$H{first_data_row}<>\"\",$E{first_data_row}>=$H{first_data_row})'],
+        f'K{first_data_row}:K{last_data_row}',
+        FormulaRule(formula=[f'AND($E{first_data_row}<>\"\",$J{first_data_row}<>\"\",$E{first_data_row}>=$J{first_data_row})'],
                     font=Font(name=arial, color='008000', bold=True)))
     ws.conditional_formatting.add(
-        f'I{first_data_row}:I{last_data_row}',
-        FormulaRule(formula=[f'AND($E{first_data_row}<>\"\",$H{first_data_row}<>\"\",$E{first_data_row}<$H{first_data_row})'],
+        f'K{first_data_row}:K{last_data_row}',
+        FormulaRule(formula=[f'AND($E{first_data_row}<>\"\",$J{first_data_row}<>\"\",$E{first_data_row}<$J{first_data_row})'],
                     font=Font(name=arial, color='FF0000', bold=True)))
 
-    widths = {'A': 32, 'B': 16, 'C': 20, 'D': 20, 'E': 16, 'F': 16, 'G': 20, 'H': 18, 'I': 18}
+    widths = {'A': 32, 'B': 16, 'C': 20, 'D': 20, 'E': 16, 'F': 20, 'G': 20,
+              'H': 20, 'I': 20, 'J': 18, 'K': 18}
     for col, w in widths.items():
         ws.column_dimensions[col].width = w
 
+    # Bloc classement (Rang / Employé classé / Productivité classée) : demarre
+    # a M (13), 1 colonne apres la fin du premier tableau (K=11), pour garder
+    # le meme espacement qu'avant l'ajout des colonnes F/G/H.
+    RANK_COL = 13  # M
     k_headers = ['Rang', 'Employé (classé)', 'Productivité /H (classée)']
     for i, h in enumerate(k_headers):
-        c = ws.cell(row=2, column=11+i, value=h)
+        c = ws.cell(row=2, column=RANK_COL+i, value=h)
         c.font = Font(name=arial, bold=True)
         c.alignment = Alignment(wrap_text=True, vertical='center', horizontal='center')
 
     e_range = f"$E${first_data_row}:$E${last_data_row}"
     a_range = f"$A${first_data_row}:$A${last_data_row}"
+    rank_col_letter = get_column_letter(RANK_COL)
+    rank_name_letter = get_column_letter(RANK_COL + 1)
+    rank_prod_letter = get_column_letter(RANK_COL + 2)
 
     for i in range(n):
         r = first_data_row + i
-        ck = ws.cell(row=r, column=11, value=f"=ROW()-{first_data_row-1}")
+        ck = ws.cell(row=r, column=RANK_COL, value=f"=ROW()-{first_data_row-1}")
         ck.font = Font(name=arial)
-        cm = ws.cell(row=r, column=13, value=f"=IFERROR(LARGE({e_range},K{r}),\"\")")
+        cm = ws.cell(row=r, column=RANK_COL + 2,
+                      value=f"=IFERROR(LARGE({e_range},{rank_col_letter}{r}),\"\")")
         cm.font = Font(name=arial)
         cm.number_format = '0.00'
-        cl = ws.cell(row=r, column=12,
-                      value=f"=IF(M{r}=\"\",\"\",IFERROR(INDEX({a_range},MATCH(M{r},{e_range},0)),\"\"))")
+        cl = ws.cell(row=r, column=RANK_COL + 1,
+                      value=(f"=IF({rank_prod_letter}{r}=\"\",\"\",IFERROR(INDEX({a_range},"
+                             f"MATCH({rank_prod_letter}{r},{e_range},0)),\"\"))"))
         cl.font = Font(name=arial)
 
-    widths2 = {'K': 8, 'L': 32, 'M': 22}
+    widths2 = {rank_col_letter: 8, rank_name_letter: 32, rank_prod_letter: 22}
     for col, w in widths2.items():
         ws.column_dimensions[col].width = w
 
-    ws.merge_cells('O1:P1')
-    ct = ws['O1']
+    # Bloc "Taux de rupture (avant substitution)" magasin : demarre a Q (17),
+    # 1 colonne apres la fin du bloc classement (O=15).
+    STORE_LABEL_COL = 17  # Q
+    STORE_VALUE_COL = 18  # R
+    store_label_letter = get_column_letter(STORE_LABEL_COL)
+    store_value_letter = get_column_letter(STORE_VALUE_COL)
+
+    ws.merge_cells(f'{store_label_letter}1:{store_value_letter}1')
+    ct = ws[f'{store_label_letter}1']
     ct.value = 'Indicateur - Taux de rupture (avant substitution)'
     ct.font = Font(name=arial, bold=True)
     ct.alignment = Alignment(horizontal='center', wrap_text=True)
 
-    ws['O2'] = 'Semaine précédente (S-1)'
-    ws['O2'].font = Font(name=arial)
-    p2 = ws['P2']
+    ws[f'{store_label_letter}2'] = 'Semaine précédente (S-1)'
+    ws[f'{store_label_letter}2'].font = Font(name=arial)
+    p2 = ws[f'{store_value_letter}2']
     p2.fill = yellow_fill
     p2.font = blue_font
     p2.number_format = '0.0%'
 
-    ws['O3'] = 'Semaine actuelle'
-    ws['O3'].font = Font(name=arial)
-    p3 = ws['P3']
+    ws[f'{store_label_letter}3'] = 'Semaine actuelle'
+    ws[f'{store_label_letter}3'].font = Font(name=arial)
+    p3 = ws[f'{store_value_letter}3']
     p3.fill = yellow_fill
     p3.font = blue_font
     p3.number_format = '0.0%'
@@ -794,22 +879,24 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     if taux_precedente is not None:
         p2.value = taux_precedente
 
-    ws['O4'] = 'Évolution'
-    ws['O4'].font = Font(name=arial, bold=True)
-    p4 = ws['P4']
-    p4.value = ('=IFERROR(IF(OR(P2="",P3=""),"",ROUND(P2*100,1)&"%"&"  "'
-                '&IF(P3<=P2,"▼","▲")&"  "&ROUND(P3*100,1)&"%"),"")')
+    ws[f'{store_label_letter}4'] = 'Évolution'
+    ws[f'{store_label_letter}4'].font = Font(name=arial, bold=True)
+    p4 = ws[f'{store_value_letter}4']
+    v2, v3 = f'{store_value_letter}2', f'{store_value_letter}3'
+    p4.value = (f'=IFERROR(IF(OR({v2}="",{v3}=""),"",ROUND({v2}*100,1)&"%"&"  "'
+                f'&IF({v3}<={v2},"▼","▲")&"  "&ROUND({v3}*100,1)&"%"),"")')
     p4.font = Font(name=arial, bold=True)
     p4.alignment = Alignment(horizontal='center')
 
+    v4 = f'{store_value_letter}4'
     ws.conditional_formatting.add(
-        'P4', FormulaRule(formula=['AND(P2<>"",P3<>"",P3<=P2)'],
-                           font=Font(name=arial, color='008000', bold=True, italic=True)))
+        v4, FormulaRule(formula=[f'AND({v2}<>"",{v3}<>"",{v3}<={v2})'],
+                         font=Font(name=arial, color='008000', bold=True, italic=True)))
     ws.conditional_formatting.add(
-        'P4', FormulaRule(formula=['AND(P2<>"",P3<>"",P3>P2)'],
-                           font=Font(name=arial, color='FF0000', bold=True, italic=True)))
+        v4, FormulaRule(formula=[f'AND({v2}<>"",{v3}<>"",{v3}>{v2})'],
+                         font=Font(name=arial, color='FF0000', bold=True, italic=True)))
 
-    widths3 = {'O': 24, 'P': 20}
+    widths3 = {store_label_letter: 24, store_value_letter: 20}
     for col, w in widths3.items():
         ws.column_dimensions[col].width = w
 
@@ -827,8 +914,8 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     chart.width = max(24, n * 2.2)
     chart.height = 12
 
-    data = Reference(ws, min_col=13, min_row=2, max_row=last_data_row)
-    cats = Reference(ws, min_col=12, min_row=first_data_row, max_row=last_data_row)
+    data = Reference(ws, min_col=RANK_COL + 2, min_row=2, max_row=last_data_row)
+    cats = Reference(ws, min_col=RANK_COL + 1, min_row=first_data_row, max_row=last_data_row)
     chart.add_data(data, titles_from_data=True)
     chart.set_categories(cats)
     cat_str_ref = StrRef(f=str(cats))
@@ -842,7 +929,7 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     # d'evolution multi-semaines plus bas. ranking_for_color a ete rempli
     # dans le meme ordre que le classement reel (trie desc. par
     # productivite), pour matcher visuellement les barres du graphique
-    # (qui sont deja triees via LARGE/INDEX/MATCH dans les colonnes K/L/M).
+    # (qui sont deja triees via LARGE/INDEX/MATCH dans le bloc classement).
     ranking_sorted = sorted(ranking_for_color, key=lambda t: t[1], reverse=True)
     chart.series[0].graphicalProperties.varyColors = True
     data_points = []
@@ -897,7 +984,7 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
     current_week_by_matricule = {}
     name_by_matricule = {}
     matricule_row_map = {}
-    for i, (nm, _, _, _, _) in enumerate(employees):
+    for i, (nm, _, _, _, _, _, _, _) in enumerate(employees):
         m = extract_matricule(nm)
         if not m:
             continue
@@ -916,7 +1003,7 @@ def build(path, outpath, taux_actuelle=None, taux_precedente=None, planning_path
         sorted_weeks = sorted(all_weeks)
         sorted_matricules = sorted(all_matricules)
 
-        trend_start_col = 18  # colonne R, a distance des blocs O:P et K:M existants
+        trend_start_col = 20  # colonne T, a distance des blocs Q:R et M:O existants
         trend_title_row = 1
         trend_header_row = 2
         trend_first_data_row = trend_header_row + 1
@@ -1102,11 +1189,28 @@ def _pdm_clean_name(nom):
     return base.title()
 
 
-def build_ranking(employee_productivity, excluded_matricules=None, min_heures=15):
+def _pdm_fmt_int(v):
+    return f"{v:g}" if v is not None else "N/D"
+
+
+def _pdm_fmt_pct(v):
+    return f"{v * 100:.1f}%" if v is not None else "N/D"
+
+
+def _pdm_fmt_manquants(manquants, articles_scannes):
+    """'65/1944' (manquants/articles scannés) -- ex: Shirley S33, 65 articles
+    manquants sur 1944 articles scannés. 'N/D' si l'une des deux valeurs est
+    absente."""
+    if manquants is None or articles_scannes is None:
+        return "N/D"
+    return f"{manquants:g}/{articles_scannes:g}"
+
+
+def build_ranking(employee_productivity, excluded_matricules=None, min_heures=12):
     """Construit la liste classee (desc. par productivite_h) a partir du dict
     retourne par build(), en excluant les responsables et les collaborateurs
     n'ayant pas atteint `min_heures` heures travaillees au Drive sur la
-    semaine (seuil minimum pour figurer au podium)."""
+    semaine (seuil minimum pour figurer au podium, 12h par defaut)."""
     excluded = excluded_matricules if excluded_matricules is not None else EXCLUDED_FROM_RANKING
     rows = []
     for matricule, data in (employee_productivity or {}).items():
@@ -1130,6 +1234,10 @@ def build_ranking(employee_productivity, excluded_matricules=None, min_heures=15
             'prod': data['productivite_h'],
             'evo': data.get('evolution_pct'),
             'up': data.get('evolution_up'),
+            'manquants': data.get('manquants'),
+            'articles_scannes': data.get('articles_scannes'),
+            'taux_avant': data.get('taux_avant'),
+            'taux_apres': data.get('taux_apres'),
         })
     rows.sort(key=lambda r: r['prod'], reverse=True)
     return rows
@@ -1137,11 +1245,11 @@ def build_ranking(employee_productivity, excluded_matricules=None, min_heures=15
 
 def generate_podium_pdf(pdf_path, week, employee_productivity, taux_actuelle=None,
                          taux_precedente=None, enseigne="INTERMARCHÉ", magasin="MONTESCOT",
-                         excluded_matricules=None, min_heures=15):
+                         excluded_matricules=None, min_heures=12):
     """Genere le PDF "podium" hebdomadaire (charte Intermarche) a partir des
     resultats de build(). Seuls les collaborateurs ayant travaille au moins
-    `min_heures` heures au Drive sur la semaine figurent au classement.
-    Retourne le nombre de collaborateurs classes."""
+    `min_heures` heures au Drive sur la semaine figurent au classement
+    (12h par defaut). Retourne le nombre de collaborateurs classes."""
     if _rl_canvas is None:
         raise RuntimeError("reportlab n'est pas installe: impossible de generer le PDF podium.")
 
@@ -1241,6 +1349,13 @@ def generate_podium_pdf(pdf_path, week, employee_productivity, taux_actuelle=Non
 
         _pdm_center_text(c, f"{p['prod']:.1f}", cx, name_bottom - 24, "Helvetica-Bold", 20, BLACK)
         _pdm_center_text(c, "articles / heure", cx, name_bottom - 36, "Helvetica", 7.5, GREY_TXT)
+        # Indicateurs rupture (position fixe depuis le bas de la carte, pour
+        # ne jamais chevaucher le nom sur une ou deux lignes ci-dessus).
+        stats_line = (f"Manq. {_pdm_fmt_manquants(p.get('manquants'), p.get('articles_scannes'))}  ·  "
+                      f"Av. subst. {_pdm_fmt_pct(p.get('taux_avant'))}  ·  "
+                      f"Ap. subst. {_pdm_fmt_pct(p.get('taux_apres'))}")
+        stats_font_size = 6.3 if _rl_stringWidth(stats_line, "Helvetica", 6.3) <= card_w - 10 else 5.3
+        _pdm_center_text(c, stats_line, cx, card_y + 34, "Helvetica", stats_font_size, GREY_TXT)
         _pdm_evolution_pill(c, cx, card_y + 10, p["up"], p["evo"], WHITE, GREEN, RED_NEG, GREY_PILL)
 
         bar_h = bar_h_map[idx]
@@ -1309,11 +1424,17 @@ def generate_podium_pdf(pdf_path, week, employee_productivity, taux_actuelle=Non
     c.setFillColor(RED)
     c.rect(36, y - header_row_h, W - 72, header_row_h, fill=1, stroke=0)
     c.setFillColor(WHITE)
+    col_rang, col_collab, col_prod = 44, 92, 210
+    col_manq, col_avant, col_apres, col_evo = 258, 336, 410, 478
     c.setFont("Helvetica-Bold", 9.5)
-    c.drawString(50, y - header_row_h + 7, "RANG")
-    c.drawString(100, y - header_row_h + 7, "COLLABORATEUR")
-    c.drawString(360, y - header_row_h + 7, "PRODUCTIVITÉ /H")
-    c.drawString(480, y - header_row_h + 7, "ÉVOLUTION S-1")
+    c.drawString(col_rang, y - header_row_h + 7, "RANG")
+    c.drawString(col_collab, y - header_row_h + 7, "COLLABORATEUR")
+    c.setFont("Helvetica-Bold", 8)
+    c.drawString(col_prod, y - header_row_h + 7, "PROD./H")
+    c.drawString(col_manq, y - header_row_h + 7, "MANQ.")
+    c.drawString(col_avant, y - header_row_h + 7, "RUPT. AV.")
+    c.drawString(col_apres, y - header_row_h + 7, "RUPT. AP.")
+    c.drawString(col_evo, y - header_row_h + 7, "ÉVOL. S-1")
     y -= header_row_h
 
     for i, p in enumerate(list_rows):
@@ -1324,18 +1445,23 @@ def generate_podium_pdf(pdf_path, week, employee_productivity, taux_actuelle=Non
             c.rect(36, row_y, W - 72, row_h, fill=1, stroke=0)
         c.setFillColor(BLACK)
         c.setFont("Helvetica-Bold", row_font)
-        c.drawString(50, row_y + text_y_offset, f"{rank}e")
+        c.drawString(col_rang, row_y + text_y_offset, f"{rank}e")
         c.setFont("Helvetica", row_font)
-        c.drawString(100, row_y + text_y_offset, p["name"])
+        c.drawString(col_collab, row_y + text_y_offset, p["name"])
         c.setFont("Helvetica-Bold", row_font)
-        c.drawString(360, row_y + text_y_offset, f"{p['prod']:.1f} art./h")
+        c.drawString(col_prod, row_y + text_y_offset, f"{p['prod']:.1f}")
+        c.setFont("Helvetica", row_font)
+        c.setFillColor(GREY_TXT)
+        c.drawString(col_manq, row_y + text_y_offset, _pdm_fmt_manquants(p.get('manquants'), p.get('articles_scannes')))
+        c.drawString(col_avant, row_y + text_y_offset, _pdm_fmt_pct(p.get('taux_avant')))
+        c.drawString(col_apres, row_y + text_y_offset, _pdm_fmt_pct(p.get('taux_apres')))
         if p["evo"] is None:
             c.setFillColor(GREY_PILL)
-            c.drawString(480, row_y + text_y_offset, "NOUVEAU")
+            c.drawString(col_evo, row_y + text_y_offset, "NOUVEAU")
         else:
             arrow = "▲" if p["up"] else "▼"
             c.setFillColor(GREEN if p["up"] else RED_NEG)
-            c.drawString(480, row_y + text_y_offset, f"{arrow} {p['evo']:.1f}%")
+            c.drawString(col_evo, row_y + text_y_offset, f"{arrow} {p['evo']:.1f}%")
         y = row_y
 
     # Garde-fou structurel : la table de classement ne doit JAMAIS empieter
@@ -1551,7 +1677,8 @@ def verify_output(prep_path, xlsx_path, planning_path=None, name_aliases=None, r
     wb_v = openpyxl.load_workbook(xlsx_path, data_only=True)
     ws_v = wb_v[prod_sheet_name]
 
-    for i, (name, prep_row, art_row, articles_count, commandes_count) in enumerate(employees):
+    for i, (name, prep_row, art_row, articles_count, commandes_count, manquants_count,
+            taux_avant, taux_apres) in enumerate(employees):
         r = 3 + i
         cell_name = ws_v.cell(row=r, column=1).value
         if cell_name != name:
@@ -1608,7 +1735,7 @@ def verify_output(prep_path, xlsx_path, planning_path=None, name_aliases=None, r
                 elif b_actual is None:
                     warnings.append(f"{name}: aucune heure trouvee dans le planning, saisie manuelle necessaire.")
 
-        for col, label in ((3, 'C'), (4, 'D'), (5, 'E'), (6, 'F'), (7, 'G'), (9, 'I')):
+        for col, label in ((3, 'C'), (4, 'D'), (5, 'E'), (6, 'F'), (7, 'G'), (8, 'H'), (9, 'I'), (11, 'K')):
             v = ws_f.cell(row=r, column=col).value
             if not (isinstance(v, str) and v.startswith('=')):
                 errors.append(

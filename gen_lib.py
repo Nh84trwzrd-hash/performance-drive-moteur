@@ -31,6 +31,7 @@ except ImportError:
 EXCLUDED_FROM_RANKING = {
     "MONTESCOT3",   # Adrien Navaro - responsable
     "PR0911201",    # Maelle Gendre - responsable
+    "PR0211201",    # Alexandra Vilavella - exclue du recap PDF (comme Adrien)
 }
 
 # Matricules exclus ENTIEREMENT de la generation (aucune ligne dans le
